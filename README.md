@@ -36,16 +36,23 @@ Requires `git` on PATH. Everything runs offline once installed. After `pip insta
 
 ```bash
 # 1. Measure — walk history into a SQLite db. Resumable; leave it running.
-python -m surveyor scan /path/to/repo --db repo.db [--since 2019-01-01] [--max-commits N]
+#    By convention the db is written beside the checkout as <repo>.db, so
+#    `scan ~/scan/spring-petclinic` writes ~/scan/spring-petclinic.db.
+surveyor scan ~/scan/spring-petclinic [--since 2019-01-01] [--max-commits N]
 
 # 2. Validate — test change-impact vs the mined bug ground-truth.
-python -m surveyor analyze repo.db --out report/                 # concurrent association
-python -m surveyor analyze repo.db --out report/ --split-at 2023-01-01   # leakage-free prediction
+#    Pass the SAME repo path; analyze finds <repo>.db by convention.
+surveyor analyze ~/scan/spring-petclinic --out report/                 # concurrent association
+surveyor analyze ~/scan/spring-petclinic --out report/ --split-at 2023-01-01   # leakage-free prediction
 ```
+
+`--db PATH` overrides the location on either command (and `analyze` also accepts a
+`.db` file directly as its argument). Add ignores ad hoc with `--ignore GLOB`
+(repeatable). Use `python -m surveyor …` if you haven't `pip install -e .`.
 
 `scan` is **incremental and resumable**: re-running skips commits already in the
 db, and a parse cache keyed by git blob OID means a file version is parsed once no
-matter how many commits carry it. Kill it any time; re-run with the same `--db` to
+matter how many commits carry it. Kill it any time; re-run against the same repo to
 continue. Ideal for an unattended multi-hour run.
 
 `analyze` writes `report.md`, `files.csv`, and `coupling.csv`. Use `--split-at`

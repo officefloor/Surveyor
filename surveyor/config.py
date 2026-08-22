@@ -34,7 +34,10 @@ LANG_BY_EXT: dict[str, str] = {
 
 DEFAULT_IGNORE = [
     "**/node_modules/**", "**/dist/**", "**/build/**", "**/target/**",
-    "**/out/**", "**/bin/**", "**/obj/**", "**/vendor/**", "**/third_party/**",
+    "**/out/**", "**/bin/**", "**/obj/**", "**/third_party/**",
+    # vendored front-end / dependency trees (note the plural 'vendors' — a real repo
+    # used it and its jQuery/Bootstrap blobs swamped the ranking with 0-fix code).
+    "**/vendor/**", "**/vendors/**", "**/bower_components/**", "**/webjars/**",
     "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.git/**",
     "**/*.min.js", "**/*.min.css", "**/*.bundle.js", "**/*.generated.*",
     "**/generated/**", "**/gen/**",
@@ -95,9 +98,16 @@ class Config:
         import yaml  # optional; only needed when a config file is passed
         with open(path) as fh:
             data = yaml.safe_load(fh) or {}
-        for key in ("ignore", "test_patterns", "cc_threshold", "rename_jaccard", "max_diff_lines"):
+        for key in ("cc_threshold", "rename_jaccard", "max_diff_lines"):
             if key in data:
                 setattr(cfg, key, data[key])
+        # ignore / test_patterns APPEND to the built-in defaults (a config adds to
+        # them, never silently drops them). To start from scratch, set the matching
+        # `*_replace` key instead.
+        cfg.ignore = list(data["ignore_replace"]) if "ignore_replace" in data \
+            else cfg.ignore + list(data.get("ignore", []))
+        cfg.test_patterns = list(data["test_patterns_replace"]) if "test_patterns_replace" in data \
+            else cfg.test_patterns + list(data.get("test_patterns", []))
         if "lang_by_ext" in data:
             cfg.lang_by_ext.update(data["lang_by_ext"])
         return cfg
