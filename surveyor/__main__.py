@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--since", help="git --since date filter, e.g. 2019-01-01")
     s.add_argument("--until", default="HEAD")
     s.add_argument("--max-commits", type=int)
+    s.add_argument("--progress-file", metavar="PATH",
+                   help="write '<done> <total>' progress to this file (for a parallel driver)")
     s.add_argument("--no-units", action="store_true",
                    help="skip per-function rows (faster; loses function-level detail)")
 
@@ -88,7 +90,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.ignore += args.ignore   # CLI globs append on top of defaults + config
         db = args.db or _default_db(args.repo)
         scan(args.repo, db, cfg, since=args.since, until=args.until,
-             max_count=args.max_commits, want_units=not args.no_units)
+             max_count=args.max_commits, want_units=not args.no_units,
+             progress_path=args.progress_file)
         print(f"db: {db}")
         print(f"Next: surveyor analyze {args.repo}")
         return 0

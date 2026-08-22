@@ -86,15 +86,31 @@ def _process_commit(repo, store, cfg, c, want_units):
 
 
 def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
-         max_count=None, want_units=True, log=print) -> int:
+         max_count=None, want_units=True, log=print, progress_path=None) -> int:
     repo = GitRepo(repo_path)
     store = Store(db_path)
     store.set_meta("repo_path", repo_path)
     commits = repo.commits(since=since, until=until, max_count=max_count)
+    total = len(commits)
+
+    def _emit(done_n: int) -> None:
+        # tiny "<done> <total>\n" file a parallel driver can poll for a progress bar.
+        if not progress_path:
+            return
+        try:
+            with open(progress_path, "w") as fh:
+                fh.write(f"{done_n} {total}\n")
+        except OSError:
+            pass
+
     done = {r[0] for r in store.db.execute("SELECT sha FROM commits").fetchall()}
+    step = max(1, total // 200)   # ~200 progress updates across the history
     processed = 0
+    _emit(0)
     try:
         for i, c in enumerate(commits):
+            if progress_path and (i % step == 0 or i == total - 1):
+                _emit(i + 1)   # advances even over already-done commits on a resume
             if c.sha in done:
                 continue
             _process_commit(repo, store, cfg, c, want_units)
@@ -102,8 +118,9 @@ def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
             processed += 1
             if processed % 50 == 0:
                 store.commit()
-                log(f"  ... {processed} commits ({i + 1}/{len(commits)})")
+                log(f"  ... {processed} commits ({i + 1}/{total})")
         store.commit()
+        _emit(total)
     finally:
         repo.close()
         store.close()

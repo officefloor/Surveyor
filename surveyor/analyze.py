@@ -4,7 +4,8 @@ Aggregates the raw scan tables to per-file features, then tests change-impact
 against a repo-mined bug ground-truth AND against churn/frequency baselines, so a
 result means "impact beats/augments size & churn", not "big files have bugs".
 
-Writes report.md + files.csv (+ coupling.csv) to an output directory. Pure Python.
+Writes report.md + files.csv + coupling.csv + commits.html to an output directory.
+Pure Python.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import os
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import stats
+from . import plot, stats
 
 
 @dataclass
@@ -206,11 +207,41 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
             P(f"| {s} | {conf:.2f} | `{a}` | `{b}` |")
         P("")
 
+    # ---- per-commit metric charts (commits.html) ----
+    METRICS = [
+        ("impact_composite", "change-impact (composite)"),
+        ("impact_mutation", "change-impact (mutation of existing code)"),
+        ("impact_godclass", "change-impact (god-class / new code)"),
+        ("files_changed", "files changed"),
+        ("mut_fns", "functions modified"),
+        ("new_fns", "functions added"),
+        ("renames", "renames"),
+    ]
+    crows = []
+    q = ("SELECT sha, subject, is_fix, is_revert, impact_composite, impact_mutation, "
+         "impact_godclass, files_changed, mut_fns, new_fns, renames "
+         "FROM commits ORDER BY rowid")
+    for i, row in enumerate(db.execute(q)):
+        d = {"idx": i, "sha": row[0], "subject": row[1] or "",
+             "bug": bool(row[2] or row[3])}   # red = is_fix OR is_revert
+        for (key, _label), val in zip(METRICS, row[4:]):
+            d[key] = val or 0
+        crows.append(d)
+    if crows:
+        meta = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
+        title = os.path.basename((meta[0] if meta else "repo").rstrip("/")) or "repo"
+        plot.write_commit_charts(crows, METRICS, os.path.join(out_dir, "commits.html"), title)
+        P("## Per-commit metric charts\n")
+        P(f"See **commits.html** — one scatter per per-commit metric, {len(crows):,} commits "
+          "on X (oldest → newest), value on Y, with **red = bug-fix commit** (fix keyword or "
+          "revert) and **blue = ordinary change**. Lets you eyeball where fixes land relative "
+          "to high-impact changes.\n")
+
     report = "\n".join(lines)
     with open(os.path.join(out_dir, "report.md"), "w") as fh:
         fh.write(report)
     db.close()
-    log(f"wrote {out_dir}/report.md, files.csv, coupling.csv")
+    log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html")
     return {"corr": corr, "partial_impact": partial_impact, "auc": aucs,
             "precision_at_k": patk, "prevalence": prevalence,
             "n_files": len(uni), "n_buggy": sum(labels)}
