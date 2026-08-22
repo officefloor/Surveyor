@@ -1,11 +1,12 @@
 """Surveyor CLI.
 
   surveyor scan    <repo> [--db path] [--since ...] [--max-commits N]
-  surveyor analyze <repo> [--db path] --out report/ [--split-at YYYY-MM-DD]
+  surveyor analyze <repo> [--db path] [--out dir] [--split-at YYYY-MM-DD]
 
-By convention the db lives beside the checkout as <repo>.db (e.g. scanning
-~/scan/spring-petclinic writes ~/scan/spring-petclinic.db), so analyze can find it
-from the same repo path. --db overrides on either command.
+By convention, beside the checkout: the db is <repo>.db and the report is
+<repo>-report/ (e.g. scanning ~/scan/spring-petclinic writes
+~/scan/spring-petclinic.db, and analyze writes ~/scan/spring-petclinic-report/).
+So you only ever pass the repo path; --db / --out override either default.
 """
 from __future__ import annotations
 
@@ -26,9 +27,20 @@ def _to_ts(date_str: str | None) -> int | None:
     return int(dt.timestamp())
 
 
+def _base(target: str) -> str:
+    """Location-convention base path: the abs repo path, or a .db stripped of .db."""
+    base = os.path.abspath(target).rstrip(os.sep)
+    return base[:-3] if base.endswith(".db") else base
+
+
 def _default_db(repo_path: str) -> str:
     """<repo>.db beside the checkout: ~/scan/spring-petclinic -> ~/scan/spring-petclinic.db"""
-    return os.path.abspath(repo_path).rstrip(os.sep) + ".db"
+    return _base(repo_path) + ".db"
+
+
+def _default_out(target: str) -> str:
+    """<repo>-report/ beside the checkout: ~/scan/spring-petclinic -> ~/scan/spring-petclinic-report"""
+    return _base(target) + "-report"
 
 
 def _resolve_db(target: str, override: str | None) -> str:
@@ -63,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("target", help="the scanned repo/checkout (its <repo>.db is read by "
                    "convention), or a .db file directly")
     a.add_argument("--db", help="db path override (default: <repo>.db beside the checkout)")
-    a.add_argument("--out", required=True)
+    a.add_argument("--out", help="report output dir (default: <repo>-report/ beside the checkout)")
     a.add_argument("--split-at", help="YYYY-MM-DD; measure predictors before, bugs after "
                    "(leakage-free predictive test). Omit for a concurrent association check.")
     a.add_argument("--include-tests", action="store_true",
@@ -78,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         scan(args.repo, db, cfg, since=args.since, until=args.until,
              max_count=args.max_commits, want_units=not args.no_units)
         print(f"db: {db}")
-        print(f"Next: surveyor analyze {args.repo} --out report/")
+        print(f"Next: surveyor analyze {args.repo}")
         return 0
 
     if args.cmd == "analyze":
@@ -88,8 +100,10 @@ def main(argv: list[str] | None = None) -> int:
                   f"       run `surveyor scan {args.target}` first, or pass --db.",
                   file=sys.stderr)
             return 2
-        print(f"db: {db}")
-        analyze(db, args.out, split_ts=_to_ts(args.split_at),
+        out = args.out or _default_out(args.target)
+        print(f"db:  {db}")
+        print(f"out: {out}")
+        analyze(db, out, split_ts=_to_ts(args.split_at),
                 exclude_tests=not args.include_tests)
         return 0
 
