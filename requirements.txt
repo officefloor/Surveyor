@@ -1,0 +1,10 @@
+# Core (required) — all offline once installed.
+lizard>=1.17          # multi-language cyclomatic complexity + function line ranges
+
+# Optional. Only needed if you pass a YAML --config file.
+PyYAML>=6.0
+
+# Optional. Richer stats / plots in a future analyze pass; the core runs without them.
+# numpy>=1.24
+# scipy>=1.10
+# matplotlib>=3.7
