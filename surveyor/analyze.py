@@ -23,7 +23,8 @@ class FileRow:
     path: str
     lang: str
     is_test: int
-    impact_before: float = 0.0
+    impact_mut: float = 0.0    # mutation of existing code — the defect predictor
+    impact_comp: float = 0.0   # composite (incl. one-time new code) — architectural cost
     churn_before: float = 0.0
     commits_before: set = field(default_factory=set)
     authors: set = field(default_factory=set)
@@ -53,7 +54,8 @@ def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
             fr.lang = lang
         before = split_ts is None or ts <= split_ts
         if before:
-            fr.impact_before += (mut or 0) + (god or 0)
+            fr.impact_mut += (mut or 0)
+            fr.impact_comp += (mut or 0) + (god or 0)
             fr.churn_before += (add or 0) + (dele or 0)
             fr.commits_before.add(sha)
             if authors.get(sha):
@@ -113,7 +115,8 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     def outcome(r: FileRow) -> int:
         return r.fix_after if split_ts is not None else r.fix_all
 
-    impact = [r.impact_before for r in uni]
+    impact = [r.impact_mut for r in uni]        # headline predictor (defect-relevant)
+    impact_comp = [r.impact_comp for r in uni]  # composite, shown for contrast
     churn = [r.churn_before for r in uni]
     ncomm = [r.n_commits for r in uni]
     hotspot = [r.max_cc * len(r.commits_before) for r in uni]
@@ -123,13 +126,16 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
 
     corr = {
         "impact": stats.spearman(impact, fixes),
+        "impact_comp": stats.spearman(impact_comp, fixes),
         "churn": stats.spearman(churn, fixes),
         "commits": stats.spearman(ncomm, fixes),
         "hotspot": stats.spearman(hotspot, fixes),
     }
     partial_impact = stats.partial_spearman(impact, fixes, churn)
+    partial_comp = stats.partial_spearman(impact_comp, fixes, churn)
     aucs = {
         "impact": stats.auc(impact, labels),
+        "impact_comp": stats.auc(impact_comp, labels),
         "churn": stats.auc(churn, labels),
         "hotspot": stats.auc(hotspot, labels),
     }
@@ -138,14 +144,14 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
                 stats.precision_at_k(churn, labels, k)) for k in ks}
 
     # ---- write files.csv --------------------------------------------------
-    uni_sorted = sorted(uni, key=lambda r: r.impact_before, reverse=True)
+    uni_sorted = sorted(uni, key=lambda r: r.impact_mut, reverse=True)
     with open(os.path.join(out_dir, "files.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["path", "lang", "impact", "churn", "commits", "authors",
-                    "max_cc", "hotspot", "fix_all", "fix_after", "is_test"])
+        w.writerow(["path", "lang", "impact_mut", "impact_composite", "churn", "commits",
+                    "authors", "max_cc", "hotspot", "fix_all", "fix_after", "is_test"])
         for r in uni_sorted:
-            w.writerow([r.path, r.lang, int(r.impact_before), int(r.churn_before),
-                        len(r.commits_before), len(r.authors), r.max_cc,
+            w.writerow([r.path, r.lang, int(r.impact_mut), int(r.impact_comp),
+                        int(r.churn_before), len(r.commits_before), len(r.authors), r.max_cc,
                         r.max_cc * len(r.commits_before), r.fix_all, r.fix_after, r.is_test])
 
     coupling = _coupling(db, min_support=3, top=25)
@@ -170,17 +176,22 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
           "Pass a split date for a leakage-free predictive test.\n")
 
     P("## Does change-impact predict bug-fix locations?\n")
+    P("**Headline predictor: change-impact (mutation)** — the cost of *disturbing existing*"
+      " code. The composite variant (which also counts one-time new code) is shown for"
+      " contrast: new code inflates it but rarely gets fixed, so it is noise for defects.\n")
     P("Spearman correlation of each file-level signal with bug-fix count:\n")
     P("| signal | Spearman vs fixes | AUC (buggy vs not) |")
     P("|---|---|---|")
-    P(f"| **change-impact** | {_fmt(corr['impact'])} | {_fmt(aucs['impact'])} |")
+    P(f"| **change-impact (mutation)** | {_fmt(corr['impact'])} | {_fmt(aucs['impact'])} |")
+    P(f"| change-impact (composite) | {_fmt(corr['impact_comp'])} | {_fmt(aucs['impact_comp'])} |")
     P(f"| churn (add+del) | {_fmt(corr['churn'])} | {_fmt(aucs['churn'])} |")
     P(f"| commit frequency | {_fmt(corr['commits'])} | n/a |")
     P(f"| hotspot (cc×freq) | {_fmt(corr['hotspot'])} | {_fmt(aucs['hotspot'])} |")
     P("")
-    P(f"**Partial** Spearman(change-impact, fixes | churn) = **{_fmt(partial_impact)}** "
-      f"— impact's signal *after* removing churn. This is the honest number: it must "
-      f"stay clearly positive for impact to add value beyond raw churn.\n")
+    P(f"**Partial** Spearman(change-impact mutation, fixes | churn) = **{_fmt(partial_impact)}** "
+      f"(composite: {_fmt(partial_comp)}) — the mutation signal *after* removing churn. This is "
+      f"the honest number: it must stay clearly positive for change-impact to add value beyond "
+      f"raw churn.\n")
 
     P("### Precision@k (top-k most-impactful files that are bug sites)\n")
     P("| k | precision@k (impact) | precision@k (churn) | lift vs base |")
@@ -191,11 +202,11 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         P(f"| {k} | {_fmt(pi)} | {_fmt(pc)} | {_fmt(lift)} |")
     P("")
 
-    P("## Top 20 painful files (by change-impact)\n")
-    P("| impact | churn | commits | max_cc | fixes | file |")
+    P("## Top 20 painful files (by change-impact mutation)\n")
+    P("| impact_mut | churn | commits | max_cc | fixes | file |")
     P("|---|---|---|---|---|---|")
     for r in uni_sorted[:20]:
-        P(f"| {int(r.impact_before)} | {int(r.churn_before)} | {len(r.commits_before)} "
+        P(f"| {int(r.impact_mut)} | {int(r.churn_before)} | {len(r.commits_before)} "
           f"| {r.max_cc} | {outcome(r)} | `{r.path}` |")
     P("")
 
@@ -209,8 +220,8 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
 
     # ---- per-commit metric charts (commits.html) ----
     METRICS = [
-        ("impact_composite", "change-impact (composite)"),
         ("impact_mutation", "change-impact (mutation of existing code)"),
+        ("impact_composite", "change-impact (composite)"),
         ("impact_godclass", "change-impact (god-class / new code)"),
         ("files_changed", "files changed"),
         ("mut_fns", "functions modified"),
@@ -242,6 +253,6 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         fh.write(report)
     db.close()
     log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html")
-    return {"corr": corr, "partial_impact": partial_impact, "auc": aucs,
-            "precision_at_k": patk, "prevalence": prevalence,
+    return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
+            "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
             "n_files": len(uni), "n_buggy": sum(labels)}
