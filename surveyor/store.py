@@ -42,6 +42,8 @@ CREATE INDEX IF NOT EXISTS ix_uc_file ON unit_changes(file_id);
 CREATE TABLE IF NOT EXISTS bug_links (
     fix_sha TEXT, inducing_sha TEXT, file_id INTEGER, unit TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_bl_ind ON bug_links(inducing_sha);
+CREATE INDEX IF NOT EXISTS ix_bl_fix ON bug_links(fix_sha);
 
 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -120,6 +122,11 @@ class Store:
             f"VALUES({','.join('?' * len(cols))})",
             tuple(row.get(c) for c in cols),
         )
+
+    def add_bug_link(self, fix_sha: str, inducing_sha: str, file_id) -> None:
+        self.db.execute(
+            "INSERT INTO bug_links(fix_sha, inducing_sha, file_id) VALUES(?,?,?)",
+            (fix_sha, inducing_sha, file_id))
 
     # ---- resume cursor ----------------------------------------------------
     def get_progress(self, key: str = "last_commit") -> str | None:

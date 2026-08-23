@@ -28,13 +28,17 @@ def _units(store: Store, cfg: Config, repo: GitRepo, rev: str, path: str):
     return src, units
 
 
-def _process_commit(repo, store, cfg, c, want_units):
+def _process_commit(repo, store, cfg, c, want_units, want_szz):
     flags = bugs.classify(c)
     diffs = repo.diff(c.parent, c.sha)
 
     touched_src = [d for d in diffs
                    if not d.is_binary and cfg.is_source(d.path) and d.status in ("A", "M", "R")]
     files_changed = len(touched_src)
+
+    # SZZ: for a bug-fix, blame the lines it changed to find the inducing commit(s).
+    # Skip sprawling fixes (huge refactors/reverts) to bound blame cost and noise.
+    do_szz = want_szz and flags.is_fix and 0 < files_changed <= cfg.szz_max_files
 
     sum_mut = sum_god = mut_fns = new_fns = renames = 0
 
@@ -43,6 +47,10 @@ def _process_commit(repo, store, cfg, c, want_units):
         if d.is_binary or cfg.is_ignored(d.path):
             continue
         fid = store.resolve_file(d.path, d.old_path if d.status == "R" else None)
+        if do_szz and d.removed and cfg.is_source(d.path):
+            for isha in repo.blame_ranges(c.parent, d.old_path or d.path, d.removed):
+                if isha != c.sha:
+                    store.add_bug_link(c.sha, isha, fid)
         fi = None
         is_src = cfg.is_source(d.path) and d.status in ("A", "M", "R")
         if is_src and (d.add_total + d.del_total) <= cfg.max_diff_lines:
@@ -86,7 +94,8 @@ def _process_commit(repo, store, cfg, c, want_units):
 
 
 def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
-         max_count=None, want_units=True, log=print, progress_path=None) -> int:
+         max_count=None, want_units=True, want_szz=True, log=print,
+         progress_path=None) -> int:
     repo = GitRepo(repo_path)
     store = Store(db_path)
     store.set_meta("repo_path", repo_path)
@@ -113,7 +122,7 @@ def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
                 _emit(i + 1)   # advances even over already-done commits on a resume
             if c.sha in done:
                 continue
-            _process_commit(repo, store, cfg, c, want_units)
+            _process_commit(repo, store, cfg, c, want_units, want_szz)
             store.set_progress(c.sha)
             processed += 1
             if processed % 50 == 0:

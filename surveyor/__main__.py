@@ -72,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="write '<done> <total>' progress to this file (for a parallel driver)")
     s.add_argument("--no-units", action="store_true",
                    help="skip per-function rows (faster; loses function-level detail)")
+    s.add_argument("--no-szz", action="store_true",
+                   help="skip SZZ (blaming bug-fixes to their inducing commits); much faster")
+    s.add_argument("--fresh", action="store_true",
+                   help="delete any existing db first for a clean rebuild (resume otherwise "
+                        "skips scanned commits and would not backfill new data like SZZ)")
 
     a = sub.add_parser("analyze", help="validate change-impact vs the mined bug ground-truth")
     a.add_argument("target", help="the scanned repo/checkout (its <repo>.db is read by "
@@ -83,15 +88,27 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--include-tests", action="store_true",
                    help="keep test files in the validation universe (default: excluded)")
 
+    aa = sub.add_parser("analyze-all", help="analyze every <repo>.db under a dir + write a "
+                        "cross-repo summary (summary.md / summary.csv)")
+    aa.add_argument("scan_dir", nargs="?", help="dir of <repo>.db files (default: ~/scan)")
+    aa.add_argument("--split-frac", type=float, default=0.75,
+                    help="per-repo split at this fraction of history (default 0.75)")
+    aa.add_argument("--split-at", help="fixed split date YYYY-MM-DD (overrides --split-frac)")
+    aa.add_argument("--concurrent", action="store_true",
+                    help="no split: association only, not leakage-free prediction")
+    aa.add_argument("--include-tests", action="store_true")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "scan":
         cfg = Config.load(args.config)
         cfg.ignore += args.ignore   # CLI globs append on top of defaults + config
         db = args.db or _default_db(args.repo)
+        if args.fresh and os.path.exists(db):
+            os.remove(db)
         scan(args.repo, db, cfg, since=args.since, until=args.until,
              max_count=args.max_commits, want_units=not args.no_units,
-             progress_path=args.progress_file)
+             want_szz=not args.no_szz, progress_path=args.progress_file)
         print(f"db: {db}")
         print(f"Next: surveyor analyze {args.repo}")
         return 0
@@ -108,6 +125,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"out: {out}")
         analyze(db, out, split_ts=_to_ts(args.split_at),
                 exclude_tests=not args.include_tests)
+        return 0
+
+    if args.cmd == "analyze-all":
+        from . import summary
+        scan_dir = os.path.expanduser(args.scan_dir or "~/scan")
+        summary.analyze_all(scan_dir, split_frac=args.split_frac, split_at=args.split_at,
+                            concurrent=args.concurrent, exclude_tests=not args.include_tests)
+        print(f"\nWrote {scan_dir}/summary.md and summary.csv")
         return 0
 
     return 1

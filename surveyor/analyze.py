@@ -218,6 +218,52 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
             P(f"| {s} | {conf:.2f} | `{a}` | `{b}` |")
         P("")
 
+    # ---- SZZ: do high-impact commits induce later bug-fixes? ----
+    szz_stats = None
+    induced = {r[0] for r in db.execute("SELECT DISTINCT inducing_sha FROM bug_links")}
+    if induced:
+        churn_by_sha = dict(db.execute(
+            "SELECT sha, SUM(add_lines + del_lines) FROM file_changes GROUP BY sha"))
+        c_imp, c_comp, c_churn, c_lab = [], [], [], []
+        for sha, im, ic in db.execute(
+                "SELECT sha, impact_mutation, impact_composite FROM commits WHERE is_merge=0"):
+            c_imp.append(im or 0)
+            c_comp.append(ic or 0)
+            c_churn.append(churn_by_sha.get(sha, 0) or 0)
+            c_lab.append(1 if sha in induced else 0)
+        n_linked = db.execute("SELECT COUNT(DISTINCT fix_sha) FROM bug_links").fetchone()[0]
+        auc_mut, auc_comp, auc_ch = (stats.auc(c_imp, c_lab), stats.auc(c_comp, c_lab),
+                                     stats.auc(c_churn, c_lab))
+        order = sorted(range(len(c_imp)), key=lambda i: c_imp[i])
+        nq = len(order)
+        quart = []
+        for k in range(4):
+            seg = order[k * nq // 4:(k + 1) * nq // 4]
+            quart.append(sum(c_lab[i] for i in seg) / len(seg) if seg else float("nan"))
+        base = (sum(c_lab) / len(c_lab)) if c_lab else float("nan")
+        szz_stats = {"auc_mut": auc_mut, "auc_comp": auc_comp, "auc_churn": auc_ch,
+                     "n_inducing": len(induced), "n_linked_fixes": n_linked,
+                     "n_commits": len(c_lab), "base_rate": base, "quartiles": quart}
+        P("## SZZ: do high-impact commits induce later bug-fixes?\n")
+        P(f"- fix commits linked to an inducer: **{n_linked:,}**")
+        P(f"- distinct inducing commits: **{len(induced):,}** of {len(c_lab):,} non-merge "
+          f"commits (base induce-rate {_fmt(base)})\n")
+        P("How well each per-commit signal ranks *inducing* commits:\n")
+        P("| predictor | AUC (inducing vs not) |")
+        P("|---|---|")
+        P(f"| **change-impact (mutation)** | {_fmt(auc_mut)} |")
+        P(f"| change-impact (composite) | {_fmt(auc_comp)} |")
+        P(f"| commit churn | {_fmt(auc_ch)} |")
+        P("")
+        P("Induce-rate by change-impact (mutation) quartile — expect it to rise Q1→Q4:\n")
+        P("| Q1 (low) | Q2 | Q3 | Q4 (high) |")
+        P("|---|---|---|---|")
+        P(f"| {_fmt(quart[0])} | {_fmt(quart[1])} | {_fmt(quart[2])} | {_fmt(quart[3])} |")
+        P("")
+        P("> **Caveat:** recency censoring — recent commits have had less time to be blamed "
+          "by a later fix, so they under-count as inducers. Read the quartile *trend*, not the "
+          "absolute rates.\n")
+
     # ---- per-commit metric charts (commits.html) ----
     METRICS = [
         ("impact_mutation", "change-impact (mutation of existing code)"),
@@ -255,4 +301,4 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html")
     return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
             "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
-            "n_files": len(uni), "n_buggy": sum(labels)}
+            "n_files": len(uni), "n_buggy": sum(labels), "szz": szz_stats}

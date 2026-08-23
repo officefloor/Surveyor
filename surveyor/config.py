@@ -71,6 +71,7 @@ class Config:
     test_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_TEST_PATTERNS))
     lang_by_ext: dict[str, str] = field(default_factory=lambda: dict(LANG_BY_EXT))
     cc_threshold: int = 10          # "eroded" function threshold (SlopCodeBench)
+    szz_max_files: int = 60         # skip SZZ-blaming fix commits that touch more files (huge refactors)
     rename_jaccard: float = 0.6     # body token-set similarity to call a rename
     max_diff_lines: int = 200_000   # skip pathological mega-diffs (generated dumps)
 
@@ -98,7 +99,7 @@ class Config:
         import yaml  # optional; only needed when a config file is passed
         with open(path) as fh:
             data = yaml.safe_load(fh) or {}
-        for key in ("cc_threshold", "rename_jaccard", "max_diff_lines"):
+        for key in ("cc_threshold", "rename_jaccard", "max_diff_lines", "szz_max_files"):
             if key in data:
                 setattr(cfg, key, data[key])
         # ignore / test_patterns APPEND to the built-in defaults (a config adds to

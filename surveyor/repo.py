@@ -138,6 +138,28 @@ class GitRepo:
         proc.stdout.read(1)  # trailing newline
         return oid, data
 
+    def blame_ranges(self, rev: str, path: str, ranges: list[tuple[int, int]]) -> set[str]:
+        """Distinct SHAs that last touched the given line ranges of <rev>:<path>, in
+        ONE blame call (SZZ inducer detection). -w -C sees through whitespace/moves.
+        Returns an empty set on error."""
+        largs: list[str] = []
+        for start, count in ranges:
+            if count > 0:
+                largs += ["-L", f"{start},{start + count - 1}"]
+        if not largs:
+            return set()
+        try:
+            out = self._run("blame", "-w", "-C", "--line-porcelain",
+                            *largs, rev, "--", path)
+        except subprocess.CalledProcessError:
+            return set()
+        shas = set()
+        for line in out.splitlines():
+            head = line.split(" ", 1)[0]
+            if len(head) == 40 and all(c in "0123456789abcdef" for c in head):
+                shas.add(head)
+        return shas
+
     def blame_lines(self, rev: str, path: str, start: int, count: int) -> list[str]:
         """SHAs that last touched lines [start, start+count) at <rev> (SZZ input).
 
