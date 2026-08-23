@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import json
 import math
 import os
 import sqlite3
@@ -79,6 +80,29 @@ def analyze_all(scan_dir: str, *, split_frac: float = 0.75, split_at: str | None
     rows.sort(key=lambda r: (r["partial_impact"] if r["partial_impact"] == r["partial_impact"]
                              else -9), reverse=True)
     _write(scan_dir, rows, mode)
+    return rows
+
+
+def summary_only(scan_dir: str, log=print) -> list[dict]:
+    """Build the cross-repo summary from existing <repo>-report/stats.json files
+    (written by `analyze`), without re-running analyze. Used by analyze-parallel.sh."""
+    rows = []
+    for sj in sorted(glob.glob(os.path.join(scan_dir, "*-report", "stats.json"))):
+        with open(sj) as fh:
+            d = json.load(fh)
+        name = d.get("name") or os.path.basename(os.path.dirname(sj))[:-7]
+        db = os.path.join(scan_dir, f"{name}.db")
+        maxcc, maxwmc, ncom = _concentration(db) if os.path.exists(db) else (0, 0, 0)
+        d.update(name=name, maxcc=maxcc, maxwmc=maxwmc, ncommits=ncom)
+        rows.append(d)
+    if not rows:
+        log(f"no <repo>-report/stats.json found under {scan_dir} — run analyze first")
+        return []
+    mode = "split" if any(r.get("split_ts") for r in rows) else "concurrent"
+    rows.sort(key=lambda r: (r["partial_impact"] if r["partial_impact"] == r["partial_impact"]
+                             else -9), reverse=True)
+    _write(scan_dir, rows, mode)
+    log(f"summary over {len(rows)} repos → {scan_dir}/summary.md")
     return rows
 
 

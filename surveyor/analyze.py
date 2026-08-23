@@ -10,6 +10,7 @@ Pure Python.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
@@ -297,8 +298,17 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     report = "\n".join(lines)
     with open(os.path.join(out_dir, "report.md"), "w") as fh:
         fh.write(report)
+
+    # machine-readable stats for a cross-repo summary (analyze-all --summary-only)
+    meta_rp = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
+    name = os.path.basename((meta_rp[0] if meta_rp else out_dir).rstrip("/")) or "repo"
+    with open(os.path.join(out_dir, "stats.json"), "w") as fh:
+        json.dump({"name": name, "split_ts": split_ts, "corr": corr,
+                   "partial_impact": partial_impact, "partial_comp": partial_comp,
+                   "auc": aucs, "prevalence": prevalence, "n_files": len(uni),
+                   "n_buggy": sum(labels), "szz": szz_stats}, fh)
     db.close()
-    log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html")
+    log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html, stats.json")
     return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
             "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
             "n_files": len(uni), "n_buggy": sum(labels), "szz": szz_stats}

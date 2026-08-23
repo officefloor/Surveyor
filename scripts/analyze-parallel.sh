@@ -12,13 +12,15 @@
 #   SCAN_DIR=~/scan            where the repos (and their <repo>.db) live
 #   JOBS=N                     override the physical-core count
 #   SURVEYOR="python -m surveyor"     override how surveyor is invoked
-#   SURVEYOR_ANALYZE_ARGS="..."       extra args passed to each analyze
-#                                     (e.g. --split-at 2022-01-01 --include-tests)
+#   SURVEYOR_ANALYZE_ARGS="..."       extra args passed to each analyze, e.g.
+#                                     "--split-frac 0.75" (leakage-free per-repo split),
+#                                     "--split-at 2022-01-01", or "--include-tests"
 #
 # Analyze reads <repo>.db and writes <repo>-report/ beside the checkout (Surveyor's
 # convention). A repo with no <repo>.db yet is SKIPPED (scan it first). Per-repo
 # console output goes to $SCAN_DIR/.surveyor/logs/<name>-analyze.log. Re-running
-# overwrites each report.
+# overwrites each report. After the per-repo analyses it builds the cross-repo
+# summary ($SCAN_DIR/summary.md, summary.csv) from their stats.json.
 set -u
 
 SCAN_DIR="${SCAN_DIR:-$HOME/scan}"
@@ -161,5 +163,11 @@ for r in "${repos[@]}"; do
   esac
 done
 echo "done: $ok analyzed, $sk skipped, $bad failed"
-if ((bad)); then echo "failed: ${badlist[*]}  (see $work/logs/)"; exit 1; fi
+(( bad )) && echo "failed: ${badlist[*]}  (see $work/logs/)"
 echo "Reports: $SCAN_DIR/<name>-report/  (report.md, files.csv, coupling.csv, commits.html)"
+
+# ---- cross-repo summary (analyze-all) from the per-repo stats.json ----
+echo; echo "Building cross-repo summary ..."
+$SURVEYOR analyze-all "$SCAN_DIR" --summary-only
+echo "Summary: $SCAN_DIR/summary.md  and  summary.csv"
+(( bad )) && exit 1 || exit 0

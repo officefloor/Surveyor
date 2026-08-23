@@ -85,6 +85,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--out", help="report output dir (default: <repo>-report/ beside the checkout)")
     a.add_argument("--split-at", help="YYYY-MM-DD; measure predictors before, bugs after "
                    "(leakage-free predictive test). Omit for a concurrent association check.")
+    a.add_argument("--split-frac", type=float,
+                   help="split at this fraction of THIS repo's history (e.g. 0.75); a per-repo "
+                        "leakage-free split. Overridden by --split-at.")
     a.add_argument("--include-tests", action="store_true",
                    help="keep test files in the validation universe (default: excluded)")
 
@@ -96,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
     aa.add_argument("--split-at", help="fixed split date YYYY-MM-DD (overrides --split-frac)")
     aa.add_argument("--concurrent", action="store_true",
                     help="no split: association only, not leakage-free prediction")
+    aa.add_argument("--summary-only", action="store_true",
+                    help="skip re-running analyze; build the summary from existing "
+                         "<repo>-report/stats.json (e.g. after analyze-parallel.sh)")
     aa.add_argument("--include-tests", action="store_true")
 
     args = ap.parse_args(argv)
@@ -121,17 +127,26 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
         out = args.out or _default_out(args.target)
+        if args.split_at:
+            split_ts = _to_ts(args.split_at)
+        elif args.split_frac:
+            from . import summary
+            split_ts = summary._percentile_ts(db, args.split_frac)
+        else:
+            split_ts = None
         print(f"db:  {db}")
         print(f"out: {out}")
-        analyze(db, out, split_ts=_to_ts(args.split_at),
-                exclude_tests=not args.include_tests)
+        analyze(db, out, split_ts=split_ts, exclude_tests=not args.include_tests)
         return 0
 
     if args.cmd == "analyze-all":
         from . import summary
         scan_dir = os.path.expanduser(args.scan_dir or "~/scan")
-        summary.analyze_all(scan_dir, split_frac=args.split_frac, split_at=args.split_at,
-                            concurrent=args.concurrent, exclude_tests=not args.include_tests)
+        if args.summary_only:
+            summary.summary_only(scan_dir)
+        else:
+            summary.analyze_all(scan_dir, split_frac=args.split_frac, split_at=args.split_at,
+                                concurrent=args.concurrent, exclude_tests=not args.include_tests)
         print(f"\nWrote {scan_dir}/summary.md and summary.csv")
         return 0
 
