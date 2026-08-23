@@ -235,6 +235,12 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         n_linked = db.execute("SELECT COUNT(DISTINCT fix_sha) FROM bug_links").fetchone()[0]
         auc_mut, auc_comp, auc_ch = (stats.auc(c_imp, c_lab), stats.auc(c_comp, c_lab),
                                      stats.auc(c_churn, c_lab))
+        # Incremental / "beyond size" test: does impact rank inducers after removing
+        # commit churn? (AUCs alone are size-inflated — a bigger commit has more lines
+        # a later fix can blame, so churn alone already ranks inducers well.)
+        lab_f = [float(x) for x in c_lab]
+        pind_mut = stats.partial_spearman(c_imp, lab_f, c_churn)
+        pind_comp = stats.partial_spearman(c_comp, lab_f, c_churn)
         order = sorted(range(len(c_imp)), key=lambda i: c_imp[i])
         nq = len(order)
         quart = []
@@ -243,19 +249,26 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
             quart.append(sum(c_lab[i] for i in seg) / len(seg) if seg else float("nan"))
         base = (sum(c_lab) / len(c_lab)) if c_lab else float("nan")
         szz_stats = {"auc_mut": auc_mut, "auc_comp": auc_comp, "auc_churn": auc_ch,
+                     "partial_mut": pind_mut, "partial_comp": pind_comp,
                      "n_inducing": len(induced), "n_linked_fixes": n_linked,
                      "n_commits": len(c_lab), "base_rate": base, "quartiles": quart}
         P("## SZZ: do high-impact commits induce later bug-fixes?\n")
         P(f"- fix commits linked to an inducer: **{n_linked:,}**")
         P(f"- distinct inducing commits: **{len(induced):,}** of {len(c_lab):,} non-merge "
           f"commits (base induce-rate {_fmt(base)})\n")
-        P("How well each per-commit signal ranks *inducing* commits:\n")
-        P("| predictor | AUC (inducing vs not) |")
-        P("|---|---|")
-        P(f"| **change-impact (mutation)** | {_fmt(auc_mut)} |")
-        P(f"| change-impact (composite) | {_fmt(auc_comp)} |")
-        P(f"| commit churn | {_fmt(auc_ch)} |")
+        P("How well each per-commit signal ranks *inducing* commits — AUC (size-inflated), "
+          "and the honest **partial vs churn** (does impact rank inducers *beyond* commit "
+          "size?):\n")
+        P("| predictor | AUC (inducing vs not) | partial vs churn |")
+        P("|---|---|---|")
+        P(f"| **change-impact (composite)** | {_fmt(auc_comp)} | **{_fmt(pind_comp)}** |")
+        P(f"| change-impact (mutation) | {_fmt(auc_mut)} | {_fmt(pind_mut)} |")
+        P(f"| commit churn | {_fmt(auc_ch)} | — |")
         P("")
+        P(f"**Partial(change-impact composite, inducing | churn) = {_fmt(pind_comp)}** — "
+          "positive means composite impact ranks bug-inducing commits *beyond* what raw "
+          "commit size explains. This is the honest number; the AUCs above are inflated "
+          "because a bigger commit simply has more lines a later fix can blame.\n")
         P("Induce-rate by change-impact (mutation) quartile — expect it to rise Q1→Q4:\n")
         P("| Q1 (low) | Q2 | Q3 | Q4 (high) |")
         P("|---|---|---|---|")
