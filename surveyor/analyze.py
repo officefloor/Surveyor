@@ -134,6 +134,9 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     }
     partial_impact = stats.partial_spearman(impact, fixes, churn)
     partial_comp = stats.partial_spearman(impact_comp, fixes, churn)
+    # head-to-head vs the nearest structural rival: does impact survive removing
+    # the hotspot baseline (max_cc x change-frequency), not just churn?
+    partial_impact_hot = stats.partial_spearman(impact, fixes, hotspot)
     aucs = {
         "impact": stats.auc(impact, labels),
         "impact_comp": stats.auc(impact_comp, labels),
@@ -193,6 +196,10 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
       f"(composite: {_fmt(partial_comp)}) — the mutation signal *after* removing churn. This is "
       f"the honest number: it must stay clearly positive for change-impact to add value beyond "
       f"raw churn.\n")
+    P(f"**Partial** Spearman(change-impact mutation, fixes | hotspot) = **{_fmt(partial_impact_hot)}** "
+      f"— the mutation signal *after* removing the **hotspot** baseline (complexity×change-frequency), "
+      f"the nearest structural rival. Positive means change-impact adds signal beyond hotspot too, "
+      f"not only beyond churn.\n")
 
     P("### Precision@k (top-k most-impactful files that are bug sites)\n")
     P("| k | precision@k (impact) | precision@k (churn) | lift vs base |")
@@ -318,10 +325,12 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     with open(os.path.join(out_dir, "stats.json"), "w") as fh:
         json.dump({"name": name, "split_ts": split_ts, "corr": corr,
                    "partial_impact": partial_impact, "partial_comp": partial_comp,
+                   "partial_impact_hot": partial_impact_hot,
                    "auc": aucs, "prevalence": prevalence, "n_files": len(uni),
                    "n_buggy": sum(labels), "szz": szz_stats}, fh)
     db.close()
     log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html, stats.json")
     return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
+            "partial_impact_hot": partial_impact_hot,
             "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
             "n_files": len(uni), "n_buggy": sum(labels), "szz": szz_stats}

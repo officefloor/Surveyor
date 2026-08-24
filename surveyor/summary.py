@@ -115,15 +115,16 @@ def _write(scan_dir: str, rows: list[dict], mode: str) -> None:
     with open(os.path.join(scan_dir, "summary.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["repo", "commits", "files", "prevalence", "partial_mut", "partial_comp",
-                    "sp_mut", "sp_churn", "auc_mut", "auc_churn",
+                    "partial_hot", "sp_mut", "sp_churn", "auc_mut", "auc_churn", "auc_hotspot",
                     "szz_auc_mut", "szz_auc_comp", "szz_auc_churn",
                     "szz_partial_comp", "szz_partial_mut", "n_inducing",
                     "max_cc", "max_wmc"])
         for r in rows:
             w.writerow([r["name"], r["ncommits"], r["n_files"], _f(r["prevalence"], 3),
                         _f(r["partial_impact"]), _f(r["partial_comp"]),
+                        _f(r.get("partial_impact_hot")),
                         _f(r["corr"]["impact"]), _f(r["corr"]["churn"]),
-                        _f(r["auc"]["impact"]), _f(r["auc"]["churn"]),
+                        _f(r["auc"]["impact"]), _f(r["auc"]["churn"]), _f(r["auc"].get("hotspot")),
                         _f(szz(r, "auc_mut")), _f(szz(r, "auc_comp")), _f(szz(r, "auc_churn")),
                         _f(szz(r, "partial_comp")), _f(szz(r, "partial_mut")),
                         szz(r, "n_inducing") or 0, r["maxcc"], r["maxwmc"]])
@@ -138,6 +139,13 @@ def _write(scan_dir: str, rows: list[dict], mode: str) -> None:
     if pm:
         L.append(f"- `partial(impact_mutation | churn)` **> 0 in {pos}/{len(pm)} repos** "
                  f"&middot; median **{_f(med)}** &middot; range {_f(min(pm))}…{_f(max(pm))}")
+    ph = [r.get("partial_impact_hot") for r in rows
+          if r.get("partial_impact_hot") is not None
+          and r.get("partial_impact_hot") == r.get("partial_impact_hot")]
+    if ph:
+        L.append(f"- `partial(impact_mutation | hotspot)` **> 0 in "
+                 f"{sum(1 for v in ph if v > 0)}/{len(ph)} repos** &middot; median "
+                 f"**{_f(sorted(ph)[len(ph) // 2])}** — signal beyond the complexity×frequency rival")
     szp = [szz(r, "partial_comp") for r in rows
            if szz(r, "partial_comp") is not None and szz(r, "partial_comp") == szz(r, "partial_comp")]
     if szp:
@@ -145,19 +153,22 @@ def _write(scan_dir: str, rows: list[dict], mode: str) -> None:
                  f"{sum(1 for v in szp if v > 0)}/{len(szp)} repos** &middot; median "
                  f"**{_f(sorted(szp)[len(szp) // 2])}** — the honest 'beyond size' inducing number")
     L.append("\n**Headline:** does change-impact (mutation) predict bug-fix locations "
-             "beyond churn? `partial_mut` is the honest number; `sp_*` are raw Spearman, "
-             "`auc_*` rank buggy files. SZZ = the per-commit question (do high-impact commits "
-             "*induce* later fixes?): `szz_comp` is the size-inflated AUC, `szz_pcomp` = "
+             "beyond churn? `partial_mut` is the honest number; `partial_hot` = "
+             "partial(impact_mutation | hotspot) is the head-to-head vs the complexity×frequency "
+             "baseline (impact must stay positive beyond hotspot, not just churn); `sp_*` are raw "
+             "Spearman, `auc_*` rank buggy files. SZZ = the per-commit question (do high-impact "
+             "commits *induce* later fixes?): `szz_comp` is the size-inflated AUC, `szz_pcomp` = "
              "partial(composite, inducing | churn) is the honest 'beyond size' number.\n")
-    L.append("| repo | commits | files | prev | partial_mut | partial_comp | sp_mut | sp_churn "
-             "| auc_mut | auc_churn | szz_comp | szz_churn | szz_pcomp | max_cc | max_wmc |")
-    L.append("|" + "---|" * 15)
+    L.append("| repo | commits | files | prev | partial_mut | partial_comp | partial_hot | sp_mut "
+             "| sp_churn | auc_mut | auc_churn | szz_comp | szz_churn | szz_pcomp | max_cc | max_wmc |")
+    L.append("|" + "---|" * 16)
     for r in rows:
-        L.append("| {name} | {nc} | {nf} | {pv} | **{pm}** | {pc} | {sm} | {sch} | {am} | {ach} "
+        L.append("| {name} | {nc} | {nf} | {pv} | **{pm}** | {pc} | {phot} | {sm} | {sch} | {am} | {ach} "
                  "| {zc} | {zch} | **{zp}** | {cc} | {wmc} |".format(
                      name=r["name"], nc=r["ncommits"], nf=r["n_files"],
                      pv=_f(r["prevalence"], 2), pm=_f(r["partial_impact"]),
-                     pc=_f(r["partial_comp"]), sm=_f(r["corr"]["impact"]),
+                     pc=_f(r["partial_comp"]), phot=_f(r.get("partial_impact_hot")),
+                     sm=_f(r["corr"]["impact"]),
                      sch=_f(r["corr"]["churn"]), am=_f(r["auc"]["impact"]),
                      ach=_f(r["auc"]["churn"]), zc=_f(szz(r, "auc_comp")),
                      zch=_f(szz(r, "auc_churn")), zp=_f(szz(r, "partial_comp")),
