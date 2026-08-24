@@ -111,22 +111,31 @@ def _write(scan_dir: str, rows: list[dict], mode: str) -> None:
         s = r.get("szz")
         return (s or {}).get(k)
 
+    def pget(r, k):
+        return (r.get("partials") or {}).get(k)
+
     # ---- summary.csv ----
     with open(os.path.join(scan_dir, "summary.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["repo", "commits", "files", "prevalence", "partial_mut", "partial_comp",
-                    "partial_hot", "sp_mut", "sp_churn", "auc_mut", "auc_churn", "auc_hotspot",
+                    "partial_hot", "partial_size", "partial_wmc", "partial_entropy",
+                    "partial_ndev", "partial_pfix", "partial_multi_core", "partial_multi_all",
+                    "sp_mut", "sp_churn", "auc_mut", "auc_churn", "auc_hotspot",
                     "szz_auc_mut", "szz_auc_comp", "szz_auc_churn",
-                    "szz_partial_comp", "szz_partial_mut", "n_inducing",
-                    "max_cc", "max_wmc"])
+                    "szz_partial_comp", "szz_partial_mut", "szz_multi_core", "szz_multi_all",
+                    "n_inducing", "max_cc", "max_wmc"])
         for r in rows:
             w.writerow([r["name"], r["ncommits"], r["n_files"], _f(r["prevalence"], 3),
                         _f(r["partial_impact"]), _f(r["partial_comp"]),
                         _f(r.get("partial_impact_hot")),
+                        _f(pget(r, "size")), _f(pget(r, "wmc")), _f(pget(r, "entropy")),
+                        _f(pget(r, "ndev")), _f(pget(r, "prior_fixes")),
+                        _f(pget(r, "multi_core")), _f(pget(r, "multi_all")),
                         _f(r["corr"]["impact"]), _f(r["corr"]["churn"]),
                         _f(r["auc"]["impact"]), _f(r["auc"]["churn"]), _f(r["auc"].get("hotspot")),
                         _f(szz(r, "auc_mut")), _f(szz(r, "auc_comp")), _f(szz(r, "auc_churn")),
                         _f(szz(r, "partial_comp")), _f(szz(r, "partial_mut")),
+                        _f(szz(r, "multi_core")), _f(szz(r, "multi_all")),
                         szz(r, "n_inducing") or 0, r["maxcc"], r["maxwmc"]])
 
     # ---- summary.md ----
@@ -146,12 +155,37 @@ def _write(scan_dir: str, rows: list[dict], mode: str) -> None:
         L.append(f"- `partial(impact_mutation | hotspot)` **> 0 in "
                  f"{sum(1 for v in ph if v > 0)}/{len(ph)} repos** &middot; median "
                  f"**{_f(sorted(ph)[len(ph) // 2])}** — signal beyond the complexity×frequency rival")
+    for key, label in (("size", "file size"), ("wmc", "total complexity ΣCC"),
+                       ("entropy", "change entropy"), ("ndev", "developers"),
+                       ("prior_fixes", "prior bug-fixes")):
+        vals = [pget(r, key) for r in rows]
+        vals = [v for v in vals if v is not None and v == v]
+        if vals:
+            L.append(f"- `partial(impact_mutation | {key})` **> 0 in "
+                     f"{sum(1 for v in vals if v > 0)}/{len(vals)} repos** &middot; median "
+                     f"**{_f(sorted(vals)[len(vals) // 2])}** — beyond {label}")
+    for key, label in (("multi_core", "churn+hotspot+size+ΣCC together"),
+                       ("multi_all", "+ entropy+developers together")):
+        vals = [pget(r, key) for r in rows]
+        vals = [v for v in vals if v is not None and v == v]
+        if vals:
+            L.append(f"- **multivariate** `partial(impact | {label})` **> 0 in "
+                     f"{sum(1 for v in vals if v > 0)}/{len(vals)} repos** &middot; median "
+                     f"**{_f(sorted(vals)[len(vals) // 2])}**")
     szp = [szz(r, "partial_comp") for r in rows
            if szz(r, "partial_comp") is not None and szz(r, "partial_comp") == szz(r, "partial_comp")]
     if szp:
         L.append(f"- SZZ `partial(impact_composite, inducing | churn)` **> 0 in "
                  f"{sum(1 for v in szp if v > 0)}/{len(szp)} repos** &middot; median "
                  f"**{_f(sorted(szp)[len(szp) // 2])}** — the honest 'beyond size' inducing number")
+    for key, label in (("multi_core", "churn+files+ΣCC+#units together"),
+                       ("multi_all", "+ commit entropy")):
+        vals = [szz(r, key) for r in rows]
+        vals = [v for v in vals if v is not None and v == v]
+        if vals:
+            L.append(f"- **SZZ multivariate** `partial(composite | {label})` **> 0 in "
+                     f"{sum(1 for v in vals if v > 0)}/{len(vals)} repos** &middot; median "
+                     f"**{_f(sorted(vals)[len(vals) // 2])}**")
     L.append("\n**Headline:** does change-impact (mutation) predict bug-fix locations "
              "beyond churn? `partial_mut` is the honest number; `partial_hot` = "
              "partial(impact_mutation | hotspot) is the head-to-head vs the complexity×frequency "

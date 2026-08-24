@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass, field
 
 from . import plot, stats
+from .repo import GitRepo
 
 
 @dataclass
@@ -30,6 +32,9 @@ class FileRow:
     commits_before: set = field(default_factory=set)
     authors: set = field(default_factory=set)
     max_cc: int = 0
+    entropy: float = 0.0          # Hassan change-entropy accrued from pre-split commits
+    size: float = float("nan")    # file size (bytes) at the split snapshot
+    wmc: float = float("nan")     # total complexity (sum CC) at the split snapshot
     fix_after: int = 0     # bug-fix commits touching the file in the outcome window
     fix_all: int = 0
 
@@ -44,6 +49,7 @@ def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
     # commit author lookup for ownership
     authors = dict(db.execute("SELECT sha, email FROM commits").fetchall())
 
+    per_sha: dict[str, dict[int, float]] = {}   # pre-split churn distribution, for entropy
     q = ("SELECT sha, file_id, lang, add_lines, del_lines, mutation_cost, "
          "godclass_cost, is_test, ts, is_fix FROM file_changes")
     for sha, fid, lang, add, dele, mut, god, is_test, ts, is_fix in db.execute(q):
@@ -57,10 +63,14 @@ def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
         if before:
             fr.impact_mut += (mut or 0)
             fr.impact_comp += (mut or 0) + (god or 0)
-            fr.churn_before += (add or 0) + (dele or 0)
+            ch = (add or 0) + (dele or 0)
+            fr.churn_before += ch
             fr.commits_before.add(sha)
             if authors.get(sha):
                 fr.authors.add(authors[sha])
+            if ch > 0:
+                d = per_sha.setdefault(sha, {})
+                d[fid] = d.get(fid, 0.0) + ch
         if is_fix:
             fr.fix_all += 1
             if split_ts is not None and ts > split_ts:
@@ -69,6 +79,21 @@ def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
     for fid, mcc in db.execute("SELECT file_id, MAX(cc) FROM unit_changes GROUP BY file_id"):
         if fid in files:
             files[fid].max_cc = mcc or 0
+
+    # change entropy (Hassan): each file accrues the entropy of every commit it was part
+    # of, where a commit's entropy is over how its churn spreads across the files it touched.
+    for dist in per_sha.values():
+        tot = sum(dist.values())
+        if tot <= 0 or len(dist) < 2:
+            continue
+        H = 0.0
+        for c in dist.values():
+            if c > 0:
+                p = c / tot
+                H -= p * math.log(p, 2)
+        for fid in dist:
+            if fid in files:
+                files[fid].entropy += H
 
     rows = list(files.values())
     # validation universe: real source files, optionally excluding tests
@@ -106,11 +131,67 @@ def _fmt(v: float) -> str:
     return "n/a" if v != v else f"{v:.3f}"   # v!=v => NaN
 
 
+def _blob_wmc(db, oid: str, cache: dict) -> int | None:
+    """Total complexity (sum CC) of a blob, from the parse cache. None if not parsed."""
+    if oid in cache:
+        return cache[oid]
+    row = db.execute("SELECT units FROM blob_cache WHERE oid=?", (oid,)).fetchone()
+    val = None
+    if row:
+        try:
+            val = sum(u[4] for u in json.loads(row[0]))   # cc is unit field index 4
+        except (ValueError, IndexError, TypeError):
+            val = None
+    cache[oid] = val
+    return val
+
+
+def _fill_size_wmc(db, split_ts: int | None, rows: list) -> None:
+    """Attach file size (bytes) and total complexity (sum CC) at the split snapshot,
+    read from the repo tree + blob parse cache. Best-effort: leaves NaN when the repo
+    is unavailable or a blob was never parsed (e.g. a file untouched in the window)."""
+    meta = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
+    if not meta or not meta[0]:
+        return
+    if split_ts is not None:
+        r = db.execute("SELECT sha FROM commits WHERE ts<=? ORDER BY ts DESC, rowid DESC "
+                       "LIMIT 1", (split_ts,)).fetchone()
+        rev = r[0] if r else "HEAD"
+    else:
+        rev = "HEAD"
+    try:
+        repo = GitRepo(meta[0])
+        tree = repo.tree_entries(rev)
+        repo.close()
+    except Exception:
+        return
+    if not tree:
+        return
+    alias = dict(db.execute("SELECT path, file_id FROM file_alias"))
+    size_by_fid: dict[int, int] = {}
+    wmc_by_fid: dict[int, int] = {}
+    cache: dict = {}
+    for path, (oid, size) in tree.items():
+        fid = alias.get(path)
+        if fid is None:
+            continue
+        size_by_fid[fid] = size
+        w = _blob_wmc(db, oid, cache)
+        if w is not None:
+            wmc_by_fid[fid] = w
+    for r in rows:
+        if r.file_id in size_by_fid:
+            r.size = float(size_by_fid[r.file_id])
+        if r.file_id in wmc_by_fid:
+            r.wmc = float(wmc_by_fid[r.file_id])
+
+
 def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
             exclude_tests: bool = True, log=print) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     db = sqlite3.connect(db_path)
     rows, uni = _load(db, split_ts, exclude_tests)
+    _fill_size_wmc(db, split_ts, uni)
 
     # outcome: post-split fixes if a split was given, else all fixes (concurrent)
     def outcome(r: FileRow) -> int:
@@ -137,6 +218,63 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     # head-to-head vs the nearest structural rival: does impact survive removing
     # the hotspot baseline (max_cc x change-frequency), not just churn?
     partial_impact_hot = stats.partial_spearman(impact, fixes, hotspot)
+
+    # ---- extra baselines: file size, total complexity, change entropy, ownership,
+    # prior bug-fixes. Each asks whether impact survives removing that rival alone. ----
+    size = [r.size for r in uni]                       # bytes at split (NaN if unknown)
+    wmc = [r.wmc for r in uni]                         # sum CC at split (NaN if unknown)
+    entropy = [r.entropy for r in uni]                 # Hassan change entropy
+    ndev = [float(len(r.authors)) for r in uni]        # distinct developers, pre-split
+    pfix = [float(r.fix_all - r.fix_after) for r in uni]   # prior bug-fixes (pre-split)
+
+    def _fin2(a, b):
+        A, B = [], []
+        for x, y in zip(a, b):
+            if x == x and y == y:      # drop NaN pairs
+                A.append(x); B.append(y)
+        return A, B
+
+    def _fin3(a, b, c):
+        A, B, C = [], [], []
+        for x, y, z in zip(a, b, c):
+            if x == x and y == y and z == z:
+                A.append(x); B.append(y); C.append(z)
+        return A, B, C
+
+    def _sp(pred):
+        a, b = _fin2(pred, fixes)
+        return stats.spearman(a, b) if len(a) > 2 else float("nan")
+
+    def _pt(pred):    # partial(change-impact, fixes | pred) on the finite subset
+        a, b, c = _fin3(impact, fixes, pred)
+        return stats.partial_spearman(a, b, c) if len(a) > 2 else float("nan")
+
+    def _ac(pred):
+        a, b = _fin2(pred, [float(x) for x in labels])
+        return stats.auc(a, [int(v) for v in b]) if a else float("nan")
+
+    xbase = {"size": size, "wmc": wmc, "entropy": entropy, "ndev": ndev, "prior_fixes": pfix}
+    sp_extra = {k: _sp(v) for k, v in xbase.items()}
+    auc_extra = {k: _ac(v) for k, v in xbase.items()}
+    partials = {"churn": partial_impact, "hotspot": partial_impact_hot,
+                "size": _pt(size), "wmc": _pt(wmc), "entropy": _pt(entropy),
+                "ndev": _pt(ndev), "prior_fixes": _pt(pfix)}
+
+    # multivariate: does impact survive removing a whole SET of rivals at once? The
+    # single-control partials above each remove one; this removes them together, the real
+    # "not just a mix of known signals" test. prior_fixes is excluded (partly circular).
+    def _mv(zcols):
+        X, Y, Z = [], [], [[] for _ in zcols]
+        for i in range(len(uni)):
+            vals = [impact[i], fixes[i]] + [z[i] for z in zcols]
+            if all(v == v for v in vals):          # keep rows finite across the whole set
+                X.append(impact[i]); Y.append(fixes[i])
+                for j, z in enumerate(zcols):
+                    Z[j].append(z[i])
+        return stats.partial_spearman_multi(X, Y, Z) if len(X) > len(zcols) + 3 else float("nan")
+
+    partials["multi_core"] = _mv([churn, hotspot, size, wmc])                  # strong rivals
+    partials["multi_all"] = _mv([churn, hotspot, size, wmc, entropy, ndev])    # + weak process
     aucs = {
         "impact": stats.auc(impact, labels),
         "impact_comp": stats.auc(impact_comp, labels),
@@ -191,6 +329,11 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     P(f"| churn (add+del) | {_fmt(corr['churn'])} | {_fmt(aucs['churn'])} |")
     P(f"| commit frequency | {_fmt(corr['commits'])} | n/a |")
     P(f"| hotspot (cc×freq) | {_fmt(corr['hotspot'])} | {_fmt(aucs['hotspot'])} |")
+    P(f"| file size (bytes) | {_fmt(sp_extra['size'])} | {_fmt(auc_extra['size'])} |")
+    P(f"| total complexity (ΣCC) | {_fmt(sp_extra['wmc'])} | {_fmt(auc_extra['wmc'])} |")
+    P(f"| change entropy (Hassan) | {_fmt(sp_extra['entropy'])} | {_fmt(auc_extra['entropy'])} |")
+    P(f"| prior bug-fixes | {_fmt(sp_extra['prior_fixes'])} | {_fmt(auc_extra['prior_fixes'])} |")
+    P(f"| developers touching file | {_fmt(sp_extra['ndev'])} | {_fmt(auc_extra['ndev'])} |")
     P("")
     P(f"**Partial** Spearman(change-impact mutation, fixes | churn) = **{_fmt(partial_impact)}** "
       f"(composite: {_fmt(partial_comp)}) — the mutation signal *after* removing churn. This is "
@@ -200,6 +343,28 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
       f"— the mutation signal *after* removing the **hotspot** baseline (complexity×change-frequency), "
       f"the nearest structural rival. Positive means change-impact adds signal beyond hotspot too, "
       f"not only beyond churn.\n")
+
+    P("### Change-impact beyond each baseline\n")
+    P("Partial Spearman of change-impact (mutation) with fixes, controlling for each rival "
+      "signal *one at a time*. Impact must stay positive after removing each:\n")
+    P("| control X | partial(change-impact, fixes \\| X) |")
+    P("|---|---|")
+    for key, label in (("churn", "churn (add+del)"), ("hotspot", "hotspot (cc×freq)"),
+                       ("size", "file size (bytes)"), ("wmc", "total complexity (ΣCC)"),
+                       ("entropy", "change entropy (Hassan)"), ("prior_fixes", "prior bug-fixes"),
+                       ("ndev", "developers touching file")):
+        P(f"| {label} | {_fmt(partials[key])} |")
+    P("")
+    P("> **Note:** these are single-control partials — each removes one rival. `prior bug-fixes` "
+      "is a strong but partly circular baseline (past fixes vs future fixes under the same label).\n")
+
+    P("### Multivariate — change-impact beyond the whole rival set at once\n")
+    P("Partial Spearman controlling for *all* controls together (rank-transform + OLS "
+      "residualisation), the strongest \"not just a mix of known signals\" test. Correlated "
+      "controls make it shrink; staying positive is the bar:\n")
+    P(f"- vs **churn + hotspot + size + complexity**: **{_fmt(partials['multi_core'])}**")
+    P(f"- vs **+ entropy + developers**: **{_fmt(partials['multi_all'])}**")
+    P("")
 
     P("### Precision@k (top-k most-impactful files that are bug sites)\n")
     P("| k | precision@k (impact) | precision@k (churn) | lift vs base |")
@@ -232,12 +397,40 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     if induced:
         churn_by_sha = dict(db.execute(
             "SELECT sha, SUM(add_lines + del_lines) FROM file_changes GROUP BY sha"))
-        c_imp, c_comp, c_churn, c_lab = [], [], [], []
-        for sha, im, ic in db.execute(
-                "SELECT sha, impact_mutation, impact_composite FROM commits WHERE is_merge=0"):
+        # commit-level complexity-volume controls, independent of the impact weighting
+        cc_by_sha, nu_by_sha = {}, {}
+        for sha, scc, ncnt in db.execute(
+                "SELECT sha, SUM(cc), COUNT(*) FROM unit_changes GROUP BY sha"):
+            cc_by_sha[sha] = scc or 0
+            nu_by_sha[sha] = ncnt or 0
+        # per-commit change entropy (how the commit's churn spreads across its files)
+        ent_by_sha, _tmp = {}, {}
+        for sha, fid, a, d in db.execute(
+                "SELECT sha, file_id, add_lines, del_lines FROM file_changes"):
+            ch = (a or 0) + (d or 0)
+            if ch > 0:
+                dd = _tmp.setdefault(sha, {})
+                dd[fid] = dd.get(fid, 0) + ch
+        for sha, dd in _tmp.items():
+            tot = sum(dd.values())
+            H = 0.0
+            if tot > 0 and len(dd) > 1:
+                for c in dd.values():
+                    p = c / tot
+                    H -= p * math.log(p, 2)
+            ent_by_sha[sha] = H
+
+        c_imp, c_comp, c_churn, c_files, c_cc, c_nu, c_ent, c_lab = ([] for _ in range(8))
+        for sha, im, ic, fchg in db.execute(
+                "SELECT sha, impact_mutation, impact_composite, files_changed "
+                "FROM commits WHERE is_merge=0"):
             c_imp.append(im or 0)
             c_comp.append(ic or 0)
             c_churn.append(churn_by_sha.get(sha, 0) or 0)
+            c_files.append(fchg or 0)
+            c_cc.append(cc_by_sha.get(sha, 0))
+            c_nu.append(nu_by_sha.get(sha, 0))
+            c_ent.append(ent_by_sha.get(sha, 0.0))
             c_lab.append(1 if sha in induced else 0)
         n_linked = db.execute("SELECT COUNT(DISTINCT fix_sha) FROM bug_links").fetchone()[0]
         auc_mut, auc_comp, auc_ch = (stats.auc(c_imp, c_lab), stats.auc(c_comp, c_lab),
@@ -248,6 +441,13 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         lab_f = [float(x) for x in c_lab]
         pind_mut = stats.partial_spearman(c_imp, lab_f, c_churn)
         pind_comp = stats.partial_spearman(c_comp, lab_f, c_churn)
+        # multivariate: does composite rank inducers beyond commit size (lines), spread
+        # (files touched), and complexity volume (ΣCC, #units) removed all at once?
+        def _mvz(zcols):
+            return (stats.partial_spearman_multi(c_comp, lab_f, zcols)
+                    if len(c_comp) > len(zcols) + 3 else float("nan"))
+        szz_multi_core = _mvz([c_churn, c_files, c_cc, c_nu])
+        szz_multi_all = _mvz([c_churn, c_files, c_cc, c_nu, c_ent])
         order = sorted(range(len(c_imp)), key=lambda i: c_imp[i])
         nq = len(order)
         quart = []
@@ -257,6 +457,7 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         base = (sum(c_lab) / len(c_lab)) if c_lab else float("nan")
         szz_stats = {"auc_mut": auc_mut, "auc_comp": auc_comp, "auc_churn": auc_ch,
                      "partial_mut": pind_mut, "partial_comp": pind_comp,
+                     "multi_core": szz_multi_core, "multi_all": szz_multi_all,
                      "n_inducing": len(induced), "n_linked_fixes": n_linked,
                      "n_commits": len(c_lab), "base_rate": base, "quartiles": quart}
         P("## SZZ: do high-impact commits induce later bug-fixes?\n")
@@ -276,6 +477,11 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
           "positive means composite impact ranks bug-inducing commits *beyond* what raw "
           "commit size explains. This is the honest number; the AUCs above are inflated "
           "because a bigger commit simply has more lines a later fix can blame.\n")
+        P(f"**Multivariate** partial(composite, inducing | churn + files + ΣCC + #units) = "
+          f"**{_fmt(szz_multi_core)}**; adding commit entropy = {_fmt(szz_multi_all)}. This "
+          "removes commit size (lines), spread (files touched), and complexity volume "
+          "*together* — the strong test that composite is more than 'a big, sprawling, "
+          "complex commit'. Correlated controls make it shrink; staying positive is the bar.\n")
         P("Induce-rate by change-impact (mutation) quartile — expect it to rise Q1→Q4:\n")
         P("| Q1 (low) | Q2 | Q3 | Q4 (high) |")
         P("|---|---|---|---|")
@@ -325,12 +531,14 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     with open(os.path.join(out_dir, "stats.json"), "w") as fh:
         json.dump({"name": name, "split_ts": split_ts, "corr": corr,
                    "partial_impact": partial_impact, "partial_comp": partial_comp,
-                   "partial_impact_hot": partial_impact_hot,
+                   "partial_impact_hot": partial_impact_hot, "partials": partials,
+                   "sp_extra": sp_extra, "auc_extra": auc_extra,
                    "auc": aucs, "prevalence": prevalence, "n_files": len(uni),
                    "n_buggy": sum(labels), "szz": szz_stats}, fh)
     db.close()
     log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html, stats.json")
     return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
-            "partial_impact_hot": partial_impact_hot,
+            "partial_impact_hot": partial_impact_hot, "partials": partials,
+            "sp_extra": sp_extra, "auc_extra": auc_extra,
             "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
             "n_files": len(uni), "n_buggy": sum(labels), "szz": szz_stats}

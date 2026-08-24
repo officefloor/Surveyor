@@ -179,6 +179,28 @@ class GitRepo:
                 shas.append(head)
         return shas
 
+    def tree_entries(self, rev: str) -> dict[str, tuple[str, int]]:
+        """{path: (blob_oid, size_bytes)} for every file at <rev>, in one ls-tree call.
+        The OID lets a caller reuse the blob parse cache; size is a file-size baseline.
+        Returns {} on error."""
+        try:
+            out = self._run("ls-tree", "-r", "--long", rev)
+        except subprocess.CalledProcessError:
+            return {}
+        entries: dict[str, tuple[str, int]] = {}
+        for line in out.splitlines():
+            if "\t" not in line:
+                continue
+            meta, path = line.split("\t", 1)
+            parts = meta.split()
+            # <mode> blob <oid> <size>\t<path>
+            if len(parts) >= 4 and parts[1] == "blob":
+                try:
+                    entries[path] = (parts[2], int(parts[3]))
+                except ValueError:
+                    continue
+        return entries
+
     def close(self) -> None:
         if self._batch and self._batch.poll() is None:
             try:
