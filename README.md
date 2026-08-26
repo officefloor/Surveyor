@@ -52,6 +52,12 @@ and `--out DIR` override the two defaults on either command (and `analyze` also
 accepts a `.db` file directly). Add ignores ad hoc with `--ignore GLOB`
 (repeatable). Use `python -m surveyor …` if you haven't `pip install -e .`.
 
+`scan` measures `WMC_other` (a unit's surrounding complexity) on the **pre-change
+container by default** (`--wmc-context before`), so importing a whole new file/class
+costs only ~`CC·Δlines` instead of being inflated by the mutual complexity of the
+functions it introduced. Pass `--wmc-context after` to reproduce the pre-2026-08
+scores. The choice is recorded in the db's `meta` table, so a db is self-describing.
+
 `scan` is **incremental and resumable**: re-running skips commits already in the
 db, and a parse cache keyed by git blob OID means a file version is parsed once no
 matter how many commits carry it. Kill it any time; re-run against the same repo to

@@ -28,7 +28,7 @@ def _units(store: Store, cfg: Config, repo: GitRepo, rev: str, path: str):
     return src, units
 
 
-def _process_commit(repo, store, cfg, c, want_units, want_szz):
+def _process_commit(repo, store, cfg, c, want_units, want_szz, wmc_context="before"):
     flags = bugs.classify(c)
     diffs = repo.diff(c.parent, c.sha)
 
@@ -61,7 +61,7 @@ def _process_commit(repo, store, cfg, c, want_units, want_szz):
                 fi = compute_file_impact(
                     before_units or [], after_units,
                     before_src or [], after_src,
-                    d.added, d.removed, cfg.rename_jaccard,
+                    d.added, d.removed, cfg.rename_jaccard, wmc_context,
                 )
         if fi is not None:
             sum_mut += fi.mutation_cost
@@ -95,10 +95,11 @@ def _process_commit(repo, store, cfg, c, want_units, want_szz):
 
 def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
          max_count=None, want_units=True, want_szz=True, log=print,
-         progress_path=None) -> int:
+         progress_path=None, wmc_context="before") -> int:
     repo = GitRepo(repo_path)
     store = Store(db_path)
     store.set_meta("repo_path", repo_path)
+    store.set_meta("wmc_context", wmc_context)
     commits = repo.commits(since=since, until=until, max_count=max_count)
     total = len(commits)
 
@@ -122,7 +123,7 @@ def scan(repo_path: str, db_path: str, cfg: Config, *, since=None, until="HEAD",
                 _emit(i + 1)   # advances even over already-done commits on a resume
             if c.sha in done:
                 continue
-            _process_commit(repo, store, cfg, c, want_units, want_szz)
+            _process_commit(repo, store, cfg, c, want_units, want_szz, wmc_context)
             store.set_progress(c.sha)
             processed += 1
             if processed % 50 == 0:

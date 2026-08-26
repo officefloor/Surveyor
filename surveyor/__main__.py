@@ -70,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-commits", type=int)
     s.add_argument("--progress-file", metavar="PATH",
                    help="write '<done> <total>' progress to this file (for a parallel driver)")
+    s.add_argument("--wmc-context", choices=("after", "before"), default="before",
+                   help="how WMC_other (surrounding complexity) is measured: 'before' the "
+                        "change (default) or 'after' it (the original definition). 'before' "
+                        "makes importing/greenfield code cheap (no prior siblings -> "
+                        "WMC_other=1) while still charging accretion onto an existing "
+                        "god-class; pass 'after' to reproduce pre-2026-08 scores.")
     s.add_argument("--no-units", action="store_true",
                    help="skip per-function rows (faster; loses function-level detail)")
     s.add_argument("--no-szz", action="store_true",
@@ -114,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(db)
         scan(args.repo, db, cfg, since=args.since, until=args.until,
              max_count=args.max_commits, want_units=not args.no_units,
-             want_szz=not args.no_szz, progress_path=args.progress_file)
+             want_szz=not args.no_szz, progress_path=args.progress_file,
+             wmc_context=args.wmc_context)
         print(f"db: {db}")
         print(f"Next: surveyor analyze {args.repo}")
         return 0

@@ -43,6 +43,24 @@ class FileRow:
         return float(len(self.commits_before))
 
 
+def _accrue_entropy(per_sha: dict, files: dict) -> None:
+    """Change entropy (Hassan): each file accrues the entropy of every commit it was
+    part of, where a commit's entropy is over how its churn spreads across the files
+    it touched. Mutates each FileRow.entropy in place."""
+    for dist in per_sha.values():
+        tot = sum(dist.values())
+        if tot <= 0 or len(dist) < 2:
+            continue
+        H = 0.0
+        for c in dist.values():
+            if c > 0:
+                p = c / tot
+                H -= p * math.log(p, 2)
+        for fid in dist:
+            if fid in files:
+                files[fid].entropy += H
+
+
 def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
     files: dict[int, FileRow] = {}
     paths = dict(db.execute("SELECT id, canonical_path FROM file_ids").fetchall())
@@ -80,20 +98,7 @@ def _load(db: sqlite3.Connection, split_ts: int | None, exclude_tests: bool):
         if fid in files:
             files[fid].max_cc = mcc or 0
 
-    # change entropy (Hassan): each file accrues the entropy of every commit it was part
-    # of, where a commit's entropy is over how its churn spreads across the files it touched.
-    for dist in per_sha.values():
-        tot = sum(dist.values())
-        if tot <= 0 or len(dist) < 2:
-            continue
-        H = 0.0
-        for c in dist.values():
-            if c > 0:
-                p = c / tot
-                H -= p * math.log(p, 2)
-        for fid in dist:
-            if fid in files:
-                files[fid].entropy += H
+    _accrue_entropy(per_sha, files)
 
     rows = list(files.values())
     # validation universe: real source files, optionally excluding tests
@@ -186,13 +191,9 @@ def _fill_size_wmc(db, split_ts: int | None, rows: list) -> None:
             r.wmc = float(wmc_by_fid[r.file_id])
 
 
-def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
-            exclude_tests: bool = True, log=print) -> dict:
-    os.makedirs(out_dir, exist_ok=True)
-    db = sqlite3.connect(db_path)
-    rows, uni = _load(db, split_ts, exclude_tests)
-    _fill_size_wmc(db, split_ts, uni)
-
+def _predictor_stats(uni: list, split_ts: int | None) -> dict:
+    """All file-level statistics: Spearman / partial / AUC / precision@k of change-impact
+    vs each baseline. Returns a bundle consumed by the report renderer and stats.json."""
     # outcome: post-split fixes if a split was given, else all fixes (concurrent)
     def outcome(r: FileRow) -> int:
         return r.fix_after if split_ts is not None else r.fix_all
@@ -284,9 +285,13 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
     ks = [k for k in (10, 25, 50) if k <= len(uni)] or [max(1, len(uni) // 10)]
     patk = {k: (stats.precision_at_k(impact, labels, k),
                 stats.precision_at_k(churn, labels, k)) for k in ks}
+    return {"corr": corr, "aucs": aucs, "partial_impact": partial_impact,
+            "partial_comp": partial_comp, "partial_impact_hot": partial_impact_hot,
+            "partials": partials, "sp_extra": sp_extra, "auc_extra": auc_extra,
+            "patk": patk, "ks": ks, "prevalence": prevalence, "n_buggy": sum(labels)}
 
-    # ---- write files.csv --------------------------------------------------
-    uni_sorted = sorted(uni, key=lambda r: r.impact_mut, reverse=True)
+
+def _write_files_csv(out_dir: str, uni_sorted: list) -> None:
     with open(os.path.join(out_dir, "files.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["path", "lang", "impact_mut", "impact_composite", "churn", "commits",
@@ -296,20 +301,108 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
                         int(r.churn_before), len(r.commits_before), len(r.authors), r.max_cc,
                         r.max_cc * len(r.commits_before), r.fix_all, r.fix_after, r.is_test])
 
-    coupling = _coupling(db, min_support=3, top=25)
+
+def _write_coupling_csv(out_dir: str, coupling: list) -> None:
     with open(os.path.join(out_dir, "coupling.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["support", "confidence", "file_a", "file_b"])
         for s, conf, a, b in coupling:
             w.writerow([s, f"{conf:.2f}", a, b])
 
-    # ---- write report.md --------------------------------------------------
+
+def _szz(db: sqlite3.Connection) -> dict | None:
+    """SZZ: do high-impact commits induce later bug-fixes? Returns per-commit ranking
+    stats (AUC + honest partials vs commit size/spread/complexity) or None if the scan
+    holds no bug-link ground-truth."""
+    induced = {r[0] for r in db.execute("SELECT DISTINCT inducing_sha FROM bug_links")}
+    if not induced:
+        return None
+    churn_by_sha = dict(db.execute(
+        "SELECT sha, SUM(add_lines + del_lines) FROM file_changes GROUP BY sha"))
+    # commit-level complexity-volume controls, independent of the impact weighting
+    cc_by_sha, nu_by_sha = {}, {}
+    for sha, scc, ncnt in db.execute(
+            "SELECT sha, SUM(cc), COUNT(*) FROM unit_changes GROUP BY sha"):
+        cc_by_sha[sha] = scc or 0
+        nu_by_sha[sha] = ncnt or 0
+    # per-commit change entropy (how the commit's churn spreads across its files)
+    ent_by_sha, _tmp = {}, {}
+    for sha, fid, a, d in db.execute(
+            "SELECT sha, file_id, add_lines, del_lines FROM file_changes"):
+        ch = (a or 0) + (d or 0)
+        if ch > 0:
+            dd = _tmp.setdefault(sha, {})
+            dd[fid] = dd.get(fid, 0) + ch
+    for sha, dd in _tmp.items():
+        tot = sum(dd.values())
+        H = 0.0
+        if tot > 0 and len(dd) > 1:
+            for c in dd.values():
+                p = c / tot
+                H -= p * math.log(p, 2)
+        ent_by_sha[sha] = H
+
+    c_imp, c_comp, c_churn, c_files, c_cc, c_nu, c_ent, c_lab = ([] for _ in range(8))
+    for sha, im, ic, fchg in db.execute(
+            "SELECT sha, impact_mutation, impact_composite, files_changed "
+            "FROM commits WHERE is_merge=0"):
+        c_imp.append(im or 0)
+        c_comp.append(ic or 0)
+        c_churn.append(churn_by_sha.get(sha, 0) or 0)
+        c_files.append(fchg or 0)
+        c_cc.append(cc_by_sha.get(sha, 0))
+        c_nu.append(nu_by_sha.get(sha, 0))
+        c_ent.append(ent_by_sha.get(sha, 0.0))
+        c_lab.append(1 if sha in induced else 0)
+    n_linked = db.execute("SELECT COUNT(DISTINCT fix_sha) FROM bug_links").fetchone()[0]
+    auc_mut, auc_comp, auc_ch = (stats.auc(c_imp, c_lab), stats.auc(c_comp, c_lab),
+                                 stats.auc(c_churn, c_lab))
+    # Incremental / "beyond size" test: does impact rank inducers after removing
+    # commit churn? (AUCs alone are size-inflated — a bigger commit has more lines
+    # a later fix can blame, so churn alone already ranks inducers well.)
+    lab_f = [float(x) for x in c_lab]
+    pind_mut = stats.partial_spearman(c_imp, lab_f, c_churn)
+    pind_comp = stats.partial_spearman(c_comp, lab_f, c_churn)
+
+    # multivariate: does composite rank inducers beyond commit size (lines), spread
+    # (files touched), and complexity volume (ΣCC, #units) removed all at once?
+    def _mvz(zcols):
+        return (stats.partial_spearman_multi(c_comp, lab_f, zcols)
+                if len(c_comp) > len(zcols) + 3 else float("nan"))
+    szz_multi_core = _mvz([c_churn, c_files, c_cc, c_nu])
+    szz_multi_all = _mvz([c_churn, c_files, c_cc, c_nu, c_ent])
+    order = sorted(range(len(c_imp)), key=lambda i: c_imp[i])
+    nq = len(order)
+    quart = []
+    for k in range(4):
+        seg = order[k * nq // 4:(k + 1) * nq // 4]
+        quart.append(sum(c_lab[i] for i in seg) / len(seg) if seg else float("nan"))
+    base = (sum(c_lab) / len(c_lab)) if c_lab else float("nan")
+    return {"auc_mut": auc_mut, "auc_comp": auc_comp, "auc_churn": auc_ch,
+            "partial_mut": pind_mut, "partial_comp": pind_comp,
+            "multi_core": szz_multi_core, "multi_all": szz_multi_all,
+            "n_inducing": len(induced), "n_linked_fixes": n_linked,
+            "n_commits": len(c_lab), "base_rate": base, "quartiles": quart}
+
+
+def _render_report(uni: list, uni_sorted: list, S: dict, coupling: list,
+                   szz: dict | None, split_ts: int | None, exclude_tests: bool) -> list:
+    """Build report.md body lines (everything but the per-commit charts section)."""
+    corr, aucs = S["corr"], S["aucs"]
+    sp_extra, auc_extra = S["sp_extra"], S["auc_extra"]
+    partial_impact, partial_comp = S["partial_impact"], S["partial_comp"]
+    partial_impact_hot, partials = S["partial_impact_hot"], S["partials"]
+    ks, patk, prevalence, n_buggy = S["ks"], S["patk"], S["prevalence"], S["n_buggy"]
+
+    def outcome(r: FileRow) -> int:
+        return r.fix_after if split_ts is not None else r.fix_all
+
     lines = []
     P = lines.append
     P(f"# Surveyor report\n")
     P(f"- files analysed (source, {'excl.' if exclude_tests else 'incl.'} tests): "
       f"**{len(uni)}**")
-    P(f"- files with a bug-fix touch: **{sum(labels)}** "
+    P(f"- files with a bug-fix touch: **{n_buggy}** "
       f"(prevalence {_fmt(prevalence)})")
     P(f"- outcome window: {'post-split fixes' if split_ts else 'ALL fixes (concurrent — see caveat)'}\n")
     if split_ts is None:
@@ -391,107 +484,54 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
             P(f"| {s} | {conf:.2f} | `{a}` | `{b}` |")
         P("")
 
-    # ---- SZZ: do high-impact commits induce later bug-fixes? ----
-    szz_stats = None
-    induced = {r[0] for r in db.execute("SELECT DISTINCT inducing_sha FROM bug_links")}
-    if induced:
-        churn_by_sha = dict(db.execute(
-            "SELECT sha, SUM(add_lines + del_lines) FROM file_changes GROUP BY sha"))
-        # commit-level complexity-volume controls, independent of the impact weighting
-        cc_by_sha, nu_by_sha = {}, {}
-        for sha, scc, ncnt in db.execute(
-                "SELECT sha, SUM(cc), COUNT(*) FROM unit_changes GROUP BY sha"):
-            cc_by_sha[sha] = scc or 0
-            nu_by_sha[sha] = ncnt or 0
-        # per-commit change entropy (how the commit's churn spreads across its files)
-        ent_by_sha, _tmp = {}, {}
-        for sha, fid, a, d in db.execute(
-                "SELECT sha, file_id, add_lines, del_lines FROM file_changes"):
-            ch = (a or 0) + (d or 0)
-            if ch > 0:
-                dd = _tmp.setdefault(sha, {})
-                dd[fid] = dd.get(fid, 0) + ch
-        for sha, dd in _tmp.items():
-            tot = sum(dd.values())
-            H = 0.0
-            if tot > 0 and len(dd) > 1:
-                for c in dd.values():
-                    p = c / tot
-                    H -= p * math.log(p, 2)
-            ent_by_sha[sha] = H
+    if szz:
+        _render_szz(P, szz)
+    return lines
 
-        c_imp, c_comp, c_churn, c_files, c_cc, c_nu, c_ent, c_lab = ([] for _ in range(8))
-        for sha, im, ic, fchg in db.execute(
-                "SELECT sha, impact_mutation, impact_composite, files_changed "
-                "FROM commits WHERE is_merge=0"):
-            c_imp.append(im or 0)
-            c_comp.append(ic or 0)
-            c_churn.append(churn_by_sha.get(sha, 0) or 0)
-            c_files.append(fchg or 0)
-            c_cc.append(cc_by_sha.get(sha, 0))
-            c_nu.append(nu_by_sha.get(sha, 0))
-            c_ent.append(ent_by_sha.get(sha, 0.0))
-            c_lab.append(1 if sha in induced else 0)
-        n_linked = db.execute("SELECT COUNT(DISTINCT fix_sha) FROM bug_links").fetchone()[0]
-        auc_mut, auc_comp, auc_ch = (stats.auc(c_imp, c_lab), stats.auc(c_comp, c_lab),
-                                     stats.auc(c_churn, c_lab))
-        # Incremental / "beyond size" test: does impact rank inducers after removing
-        # commit churn? (AUCs alone are size-inflated — a bigger commit has more lines
-        # a later fix can blame, so churn alone already ranks inducers well.)
-        lab_f = [float(x) for x in c_lab]
-        pind_mut = stats.partial_spearman(c_imp, lab_f, c_churn)
-        pind_comp = stats.partial_spearman(c_comp, lab_f, c_churn)
-        # multivariate: does composite rank inducers beyond commit size (lines), spread
-        # (files touched), and complexity volume (ΣCC, #units) removed all at once?
-        def _mvz(zcols):
-            return (stats.partial_spearman_multi(c_comp, lab_f, zcols)
-                    if len(c_comp) > len(zcols) + 3 else float("nan"))
-        szz_multi_core = _mvz([c_churn, c_files, c_cc, c_nu])
-        szz_multi_all = _mvz([c_churn, c_files, c_cc, c_nu, c_ent])
-        order = sorted(range(len(c_imp)), key=lambda i: c_imp[i])
-        nq = len(order)
-        quart = []
-        for k in range(4):
-            seg = order[k * nq // 4:(k + 1) * nq // 4]
-            quart.append(sum(c_lab[i] for i in seg) / len(seg) if seg else float("nan"))
-        base = (sum(c_lab) / len(c_lab)) if c_lab else float("nan")
-        szz_stats = {"auc_mut": auc_mut, "auc_comp": auc_comp, "auc_churn": auc_ch,
-                     "partial_mut": pind_mut, "partial_comp": pind_comp,
-                     "multi_core": szz_multi_core, "multi_all": szz_multi_all,
-                     "n_inducing": len(induced), "n_linked_fixes": n_linked,
-                     "n_commits": len(c_lab), "base_rate": base, "quartiles": quart}
-        P("## SZZ: do high-impact commits induce later bug-fixes?\n")
-        P(f"- fix commits linked to an inducer: **{n_linked:,}**")
-        P(f"- distinct inducing commits: **{len(induced):,}** of {len(c_lab):,} non-merge "
-          f"commits (base induce-rate {_fmt(base)})\n")
-        P("How well each per-commit signal ranks *inducing* commits — AUC (size-inflated), "
-          "and the honest **partial vs churn** (does impact rank inducers *beyond* commit "
-          "size?):\n")
-        P("| predictor | AUC (inducing vs not) | partial vs churn |")
-        P("|---|---|---|")
-        P(f"| **change-impact (composite)** | {_fmt(auc_comp)} | **{_fmt(pind_comp)}** |")
-        P(f"| change-impact (mutation) | {_fmt(auc_mut)} | {_fmt(pind_mut)} |")
-        P(f"| commit churn | {_fmt(auc_ch)} | — |")
-        P("")
-        P(f"**Partial(change-impact composite, inducing | churn) = {_fmt(pind_comp)}** — "
-          "positive means composite impact ranks bug-inducing commits *beyond* what raw "
-          "commit size explains. This is the honest number; the AUCs above are inflated "
-          "because a bigger commit simply has more lines a later fix can blame.\n")
-        P(f"**Multivariate** partial(composite, inducing | churn + files + ΣCC + #units) = "
-          f"**{_fmt(szz_multi_core)}**; adding commit entropy = {_fmt(szz_multi_all)}. This "
-          "removes commit size (lines), spread (files touched), and complexity volume "
-          "*together* — the strong test that composite is more than 'a big, sprawling, "
-          "complex commit'. Correlated controls make it shrink; staying positive is the bar.\n")
-        P("Induce-rate by change-impact (mutation) quartile — expect it to rise Q1→Q4:\n")
-        P("| Q1 (low) | Q2 | Q3 | Q4 (high) |")
-        P("|---|---|---|---|")
-        P(f"| {_fmt(quart[0])} | {_fmt(quart[1])} | {_fmt(quart[2])} | {_fmt(quart[3])} |")
-        P("")
-        P("> **Caveat:** recency censoring — recent commits have had less time to be blamed "
-          "by a later fix, so they under-count as inducers. Read the quartile *trend*, not the "
-          "absolute rates.\n")
 
-    # ---- per-commit metric charts (commits.html) ----
+def _render_szz(P, szz: dict) -> None:
+    """Append the SZZ report section from a computed _szz() bundle."""
+    n_linked = szz["n_linked_fixes"]
+    induced_n, n_commits, base = szz["n_inducing"], szz["n_commits"], szz["base_rate"]
+    auc_comp, auc_mut, auc_ch = szz["auc_comp"], szz["auc_mut"], szz["auc_churn"]
+    pind_comp, pind_mut = szz["partial_comp"], szz["partial_mut"]
+    szz_multi_core, szz_multi_all = szz["multi_core"], szz["multi_all"]
+    quart = szz["quartiles"]
+    P("## SZZ: do high-impact commits induce later bug-fixes?\n")
+    P(f"- fix commits linked to an inducer: **{n_linked:,}**")
+    P(f"- distinct inducing commits: **{induced_n:,}** of {n_commits:,} non-merge "
+      f"commits (base induce-rate {_fmt(base)})\n")
+    P("How well each per-commit signal ranks *inducing* commits — AUC (size-inflated), "
+      "and the honest **partial vs churn** (does impact rank inducers *beyond* commit "
+      "size?):\n")
+    P("| predictor | AUC (inducing vs not) | partial vs churn |")
+    P("|---|---|---|")
+    P(f"| **change-impact (composite)** | {_fmt(auc_comp)} | **{_fmt(pind_comp)}** |")
+    P(f"| change-impact (mutation) | {_fmt(auc_mut)} | {_fmt(pind_mut)} |")
+    P(f"| commit churn | {_fmt(auc_ch)} | — |")
+    P("")
+    P(f"**Partial(change-impact composite, inducing | churn) = {_fmt(pind_comp)}** — "
+      "positive means composite impact ranks bug-inducing commits *beyond* what raw "
+      "commit size explains. This is the honest number; the AUCs above are inflated "
+      "because a bigger commit simply has more lines a later fix can blame.\n")
+    P(f"**Multivariate** partial(composite, inducing | churn + files + ΣCC + #units) = "
+      f"**{_fmt(szz_multi_core)}**; adding commit entropy = {_fmt(szz_multi_all)}. This "
+      "removes commit size (lines), spread (files touched), and complexity volume "
+      "*together* — the strong test that composite is more than 'a big, sprawling, "
+      "complex commit'. Correlated controls make it shrink; staying positive is the bar.\n")
+    P("Induce-rate by change-impact (mutation) quartile — expect it to rise Q1→Q4:\n")
+    P("| Q1 (low) | Q2 | Q3 | Q4 (high) |")
+    P("|---|---|---|---|")
+    P(f"| {_fmt(quart[0])} | {_fmt(quart[1])} | {_fmt(quart[2])} | {_fmt(quart[3])} |")
+    P("")
+    P("> **Caveat:** recency censoring — recent commits have had less time to be blamed "
+      "by a later fix, so they under-count as inducers. Read the quartile *trend*, not the "
+      "absolute rates.\n")
+
+
+def _write_commit_charts(db: sqlite3.Connection, out_dir: str) -> list:
+    """Write commits.html (one scatter per per-commit metric) and return the report
+    section lines pointing at it (empty if there are no commits)."""
     METRICS = [
         ("impact_mutation", "change-impact (mutation of existing code)"),
         ("impact_composite", "change-impact (composite)"),
@@ -511,34 +551,59 @@ def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
         for (key, _label), val in zip(METRICS, row[4:]):
             d[key] = val or 0
         crows.append(d)
-    if crows:
-        meta = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
-        title = os.path.basename((meta[0] if meta else "repo").rstrip("/")) or "repo"
-        plot.write_commit_charts(crows, METRICS, os.path.join(out_dir, "commits.html"), title)
-        P("## Per-commit metric charts\n")
-        P(f"See **commits.html** — one scatter per per-commit metric, {len(crows):,} commits "
-          "on X (oldest → newest), value on Y, with **red = bug-fix commit** (fix keyword or "
-          "revert) and **blue = ordinary change**. Lets you eyeball where fixes land relative "
-          "to high-impact changes.\n")
+    if not crows:
+        return []
+    meta = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
+    title = os.path.basename((meta[0] if meta else "repo").rstrip("/")) or "repo"
+    plot.write_commit_charts(crows, METRICS, os.path.join(out_dir, "commits.html"), title)
+    return [
+        "## Per-commit metric charts\n",
+        f"See **commits.html** — one scatter per per-commit metric, {len(crows):,} commits "
+        "on X (oldest → newest), value on Y, with **red = bug-fix commit** (fix keyword or "
+        "revert) and **blue = ordinary change**. Lets you eyeball where fixes land relative "
+        "to high-impact changes.\n",
+    ]
 
-    report = "\n".join(lines)
-    with open(os.path.join(out_dir, "report.md"), "w") as fh:
-        fh.write(report)
 
-    # machine-readable stats for a cross-repo summary (analyze-all --summary-only)
+def _write_stats_json(db: sqlite3.Connection, out_dir: str, S: dict,
+                      split_ts: int | None, n_files: int, szz: dict | None) -> None:
+    """Machine-readable stats for a cross-repo summary (analyze-all --summary-only)."""
     meta_rp = db.execute("SELECT value FROM meta WHERE key='repo_path'").fetchone()
     name = os.path.basename((meta_rp[0] if meta_rp else out_dir).rstrip("/")) or "repo"
     with open(os.path.join(out_dir, "stats.json"), "w") as fh:
-        json.dump({"name": name, "split_ts": split_ts, "corr": corr,
-                   "partial_impact": partial_impact, "partial_comp": partial_comp,
-                   "partial_impact_hot": partial_impact_hot, "partials": partials,
-                   "sp_extra": sp_extra, "auc_extra": auc_extra,
-                   "auc": aucs, "prevalence": prevalence, "n_files": len(uni),
-                   "n_buggy": sum(labels), "szz": szz_stats}, fh)
+        json.dump({"name": name, "split_ts": split_ts, "corr": S["corr"],
+                   "partial_impact": S["partial_impact"], "partial_comp": S["partial_comp"],
+                   "partial_impact_hot": S["partial_impact_hot"], "partials": S["partials"],
+                   "sp_extra": S["sp_extra"], "auc_extra": S["auc_extra"],
+                   "auc": S["aucs"], "prevalence": S["prevalence"], "n_files": n_files,
+                   "n_buggy": S["n_buggy"], "szz": szz}, fh)
+
+
+def analyze(db_path: str, out_dir: str, *, split_ts: int | None = None,
+            exclude_tests: bool = True, log=print) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
+    db = sqlite3.connect(db_path)
+    rows, uni = _load(db, split_ts, exclude_tests)
+    _fill_size_wmc(db, split_ts, uni)
+
+    S = _predictor_stats(uni, split_ts)
+    uni_sorted = sorted(uni, key=lambda r: r.impact_mut, reverse=True)
+    _write_files_csv(out_dir, uni_sorted)
+
+    coupling = _coupling(db, min_support=3, top=25)
+    _write_coupling_csv(out_dir, coupling)
+
+    szz = _szz(db)
+    lines = _render_report(uni, uni_sorted, S, coupling, szz, split_ts, exclude_tests)
+    lines += _write_commit_charts(db, out_dir)
+    with open(os.path.join(out_dir, "report.md"), "w") as fh:
+        fh.write("\n".join(lines))
+
+    _write_stats_json(db, out_dir, S, split_ts, len(uni), szz)
     db.close()
     log(f"wrote {out_dir}/report.md, files.csv, coupling.csv, commits.html, stats.json")
-    return {"corr": corr, "partial_impact": partial_impact, "partial_comp": partial_comp,
-            "partial_impact_hot": partial_impact_hot, "partials": partials,
-            "sp_extra": sp_extra, "auc_extra": auc_extra,
-            "auc": aucs, "precision_at_k": patk, "prevalence": prevalence,
-            "n_files": len(uni), "n_buggy": sum(labels), "szz": szz_stats}
+    return {"corr": S["corr"], "partial_impact": S["partial_impact"],
+            "partial_comp": S["partial_comp"], "partial_impact_hot": S["partial_impact_hot"],
+            "partials": S["partials"], "sp_extra": S["sp_extra"], "auc_extra": S["auc_extra"],
+            "auc": S["aucs"], "precision_at_k": S["patk"], "prevalence": S["prevalence"],
+            "n_files": len(uni), "n_buggy": S["n_buggy"], "szz": szz}

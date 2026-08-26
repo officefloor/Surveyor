@@ -43,7 +43,12 @@ change_impact  = files_changed · Σ_units cost(unit)
 - `CC` = that unit's cyclomatic complexity (post-change).
 - `Δlines` = lines the diff changed inside the unit.
 - `WMC_other` = Σ CC of the **other** units in the same **container** (the context
-  you must hold to change it safely). Floor of 1.
+  you must hold to change it safely), measured on the **pre-change (before)** container
+  by default. Floor of 1. A unit added to a brand-new container therefore has no prior
+  siblings → `WMC_other` = 1 (importing/greenfield code costs only ~`CC·Δlines`), while
+  a method accreted onto an existing (god) class is still charged for the siblings that
+  were already there. `--wmc-context after` measures it on the resulting file instead
+  (the pre-2026-08 definition; reproduces the older scores).
 - `files_changed` = distinct source files the commit touched (a spread penalty).
 - A within-commit **rename** (body token-set Jaccard ≥ 0.6) is scored as a
   mutation, not a free addition.
@@ -172,8 +177,11 @@ For each non-merge commit `C` with first parent `P`:
    `Δlines` = touched lines within it.
 4. Classify each changed unit: **new** (only in `after`, no rename match), **modified**
    (present in both), **renamed** (best Jaccard ≥ 0.6 to a removed `before` unit).
-5. `WMC_other(u)` = Σ CC of the other units sharing `u.container` in `after`
-   (floor 1). `cost(u) = max(WMC_other,1)·CC·max(1,Δlines)`.
+5. `WMC_other(u)` = Σ CC of the other units sharing `u.container`, in the **before**
+   file by default (floor 1) — a new unit in a new container has none, so `WMC_other`=1;
+   a new unit in a pre-existing container is charged for the siblings already there; a
+   modified unit subtracts its own prior CC. `--wmc-context after` uses the resulting
+   file instead. `cost(u) = max(WMC_other,1)·CC·max(1,Δlines)`.
 6. `impact_mutation` = Σ cost over modified/renamed; `impact_godclass` = Σ cost over
    new; `impact_composite = (mutation+godclass) · files_changed`. Persist all three
    plus raw counts, per commit **and** attributed per file/per unit (for the
